@@ -6,4 +6,4 @@ Access-key enforced Telegram bot for authorized phone-number OSINT lookups.
 
 ```bat
 pip install -r requirements.txt
-python app.py
+python test.py
