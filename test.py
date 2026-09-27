@@ -850,7 +850,7 @@ async def do_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, number: 
                                            parse_mode=ParseMode.MARKDOWN)
             return
 
-    msg = await context.bot.send_message(chat.id, "🔎 API se query kar raha hoon…")
+    msg = await context.bot.send_message(chat.id, "🔎 Processing information request…")
 
     try:
         result = await lookup_number(number)
