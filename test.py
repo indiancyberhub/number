@@ -2,6 +2,7 @@
 Indian Cyber Hub - Authorized/Public-Data OSINT Bot
 Config pre-set. Just run: python bot.py
 Hidden fields: expiry_date, days_left, developer, updates
+Channel-gate: users must join all REQUIRED_CHANNELS before using the bot.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import string
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from typing import Any, Optional
 
 import requests
@@ -68,6 +70,23 @@ HIDDEN_API_KEYS = {
     "developer",
     "updates",
 }
+
+# ===========================================================================
+# 📢 REQUIRED CHANNELS — user ko in sab ko join karna zaroori hai
+# ===========================================================================
+# NOTE: Bot ko in channels me admin banana zaroori hai (especially private ones)
+#       taaki get_chat_member reliably kaam kare.
+REQUIRED_CHANNELS = [
+    {"username": "@indiancyberhub24", "name": "Indian Cyber Hub",       "url": "https://t.me/indiancyberhub24"},
+    {"username": "@rootrats",         "name": "Root Rats",               "url": "https://t.me/rootrats"},
+    {"username": "@apk_hub_24",       "name": "APK Hub",                 "url": "https://t.me/apk_hub_24"},
+    {"username": "@x_dark_data",      "name": "X Dark Data",             "url": "https://t.me/x_dark_data"},
+    {"username": "@darkosinteapi",    "name": "Dark OSINT API",          "url": "https://t.me/darkosinteapi"},
+    {"username": "@i_c_h_chat",       "name": "ICH Chat",                "url": "https://t.me/i_c_h_chat"},
+]
+
+# Valid membership statuses
+_VALID_MEMBER_STATUSES = {"creator", "administrator", "member"}
 
 
 def validate_config() -> None:
@@ -658,8 +677,111 @@ def check_access(user_id: int) -> tuple[bool, str]:
 
 
 # ===========================================================================
+# 📢 CHANNEL GATE — force-join helpers
+# ===========================================================================
+def channels_join_keyboard() -> InlineKeyboardMarkup:
+    """Inline keyboard: one Join button per channel + Verify/Main Menu button."""
+    rows: list[list[InlineKeyboardButton]] = []
+    # Pair channels two-per-row for compactness (6 channels → 3 rows)
+    pair: list[InlineKeyboardButton] = []
+    for ch in REQUIRED_CHANNELS:
+        pair.append(InlineKeyboardButton(f"📢 {ch['name']}", url=ch["url"]))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([InlineKeyboardButton("✅ Verify / Main Menu", callback_data="u:verify")])
+    return InlineKeyboardMarkup(rows)
+
+
+def channels_join_text() -> str:
+    lines = [
+        "🔐 *Channel Membership Required*",
+        "",
+        "Bot use karne ke liye pehle in saare channels ko join karna zaroori hai:",
+        "",
+    ]
+    for i, ch in enumerate(REQUIRED_CHANNELS, 1):
+        lines.append(f"{i}. [{ch['name']}]({ch['url']})")
+    lines += [
+        "",
+        "👆 Upar ke *📢 buttons* se saare channels join karo,",
+        "phir *✅ Verify* button dabao.",
+        "",
+        "⚠️ Bina join kiye bot use nahi kar sakte.",
+    ]
+    return "\n".join(lines)
+
+
+async def check_all_channels_joined(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> list[str]:
+    """
+    Returns list of channel names the user has NOT joined.
+    Empty list = user is in all required channels.
+    """
+    missing: list[str] = []
+    for ch in REQUIRED_CHANNELS:
+        try:
+            member = await context.bot.get_chat_member(
+                chat_id=ch["username"], user_id=user_id
+            )
+            status = getattr(member, "status", "").lower()
+            if status not in _VALID_MEMBER_STATUSES:
+                missing.append(ch["name"])
+        except Exception as e:
+            # If bot can't check (not admin / channel private / user not found),
+            # treat as "not joined" to be safe.
+            log.warning("Channel check failed for %s / user %s: %s", ch["username"], user_id, e)
+            missing.append(ch["name"])
+    return missing
+
+
+async def send_join_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the 'join these channels' message with keyboard."""
+    text = channels_join_text()
+    kb = channels_join_keyboard()
+    if update.message:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
+                                        reply_markup=kb, disable_web_page_preview=True)
+    elif update.callback_query and update.callback_query.message:
+        try:
+            await update.callback_query.message.edit_text(
+                text, parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb, disable_web_page_preview=True)
+        except Exception:
+            await update.callback_query.message.reply_text(
+                text, parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb, disable_web_page_preview=True)
+
+
+def require_channels(func):
+    """
+    Decorator: ensures the user has joined ALL required channels
+    before running the wrapped handler. Admins are exempt.
+    Works for both message-handlers and callback-query-handlers.
+    """
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        u = update.effective_user
+        if u is None:
+            return
+        # Admins bypass the gate
+        if is_admin(u.id):
+            return await func(update, context, *args, **kwargs)
+
+        missing = await check_all_channels_joined(context, u.id)
+        if missing:
+            await send_join_prompt(update, context)
+            return
+        return await func(update, context, *args, **kwargs)
+
+    return wrapper
+
+
+# ===========================================================================
 # USER COMMANDS
 # ===========================================================================
+@require_channels
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     touch_user(update)
     uid = update.effective_user.id
@@ -700,6 +822,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+@require_channels
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     touch_user(update)
     uid = update.effective_user.id
@@ -732,6 +855,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+@require_channels
 async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     touch_user(update)
     if not context.args:
@@ -773,6 +897,7 @@ async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+@require_channels
 async def cmd_credits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     touch_user(update)
     uid = update.effective_user.id
@@ -790,6 +915,7 @@ async def cmd_credits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+@require_channels
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     touch_user(update)
     uid = update.effective_user.id
@@ -818,9 +944,46 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def cmd_verify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the '✅ Verify / Main Menu' button from the channel-gate prompt."""
+    u = update.effective_user
+    if u is None:
+        return
+    touch_user(update)
+
+    # Admins bypass
+    if is_admin(u.id):
+        await update.message.reply_text(
+            "✅ You are an admin. Use /start or /admin.",
+            reply_markup=main_menu(True),
+        )
+        return
+
+    missing = await check_all_channels_joined(context, u.id)
+    if missing:
+        text = (
+            "❌ *Abhi bhi kuch channels join nahi kiye:*\n\n"
+            + "\n".join(f"• {m}" for m in missing)
+            + "\n\n👆 Sabhi channels join karo, phir *✅ Verify* dabao."
+        )
+        await update.message.reply_text(
+            text, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=channels_join_keyboard(),
+        )
+        return
+
+    await update.message.reply_text(
+        "✅ *Verification Successful!*\n\nAb aap bot use kar sakte ho.\n"
+        "/start – main menu",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu(is_admin(u.id)),
+    )
+
+
 # ===========================================================================
 # LOOKUP
 # ===========================================================================
+@require_channels
 async def do_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, number: str) -> None:
     uid = update.effective_user.id
     uname = update.effective_user.username or ""
@@ -920,6 +1083,7 @@ async def do_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, number: 
             await msg.edit_text(header + body + footer)
 
 
+@require_channels
 async def cmd_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     touch_user(update)
     if not context.args:
@@ -938,6 +1102,7 @@ async def cmd_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await do_lookup(update, context, number)
 
 
+@require_channels
 async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     touch_user(update)
     text = (update.message.text or "").strip()
@@ -1252,6 +1417,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     log.info("callback: %s from %s", data, uid)
 
+    # ---- Channel-gate verify button (must be allowed through even if not joined) ----
+    if data == "u:verify":
+        await cmd_verify(update, context)
+        return
+
+    # ---- Admins bypass the channel gate for all callbacks ----
+    if not is_admin(uid):
+        missing = await check_all_channels_joined(context, uid)
+        if missing:
+            await send_join_prompt(update, context)
+            return
+
     # USER
     if data == "u:howlookup":
         await q.message.reply_text(
@@ -1346,6 +1523,7 @@ async def run() -> None:
     log.info("Owner ID: %s | Admins: %s", OWNER_ID, ADMIN_IDS)
     log.info("API: %s", PUBLIC_OSINT_API_URL)
     log.info("Hidden keys: %s", sorted(HIDDEN_API_KEYS))
+    log.info("Required channels: %s", [c["username"] for c in REQUIRED_CHANNELS])
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -1370,6 +1548,7 @@ async def run() -> None:
     app.add_handler(CommandHandler("lookup", cmd_lookup))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("credits", cmd_credits))
+    app.add_handler(CommandHandler("verify", cmd_verify))   # <-- NEW
 
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("newcode", cmd_newcode))
