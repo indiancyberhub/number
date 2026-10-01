@@ -1,5 +1,5 @@
 """
-Indian Cyber Hub - OSINT Bot (All Buttons Working)
+Indian Cyber Hub - OSINT Bot (All Fixed + Auto-Cleanup)
 Run: python test.py
 """
 from __future__ import annotations
@@ -58,9 +58,14 @@ SHOW_RAW_API_RESPONSE = True
 
 HIDDEN_API_KEYS = {"expiry_date", "days_left", "developer", "updates"}
 
+# ✅ Sirf 1 channel — ye DB me seed hoga
 DEFAULT_CHANNELS = [
     {"username": "@indiancyberhub24", "name": "Indian Cyber Hub", "url": "https://t.me/indiancyberhub24"},
 ]
+
+# ⚠️ Force reset — pehli baar chalne par purane channels delete kar dega
+# True rakho pehli baar, phir False kar sakte ho
+FORCE_CLEAN_CHANNELS = False
 
 _REQUIRED_CHANNELS: list[dict] = []
 
@@ -170,6 +175,13 @@ def db_remove_channel(username: str) -> bool:
         return cur.rowcount > 0
 
 
+def db_clear_channels() -> int:
+    """Delete ALL channels from DB. Returns count deleted."""
+    with _conn() as c:
+        cur = c.execute("DELETE FROM required_channels")
+        return cur.rowcount
+
+
 def db_list_channels() -> list:
     with _conn() as c:
         return c.execute(
@@ -178,8 +190,21 @@ def db_list_channels() -> list:
 
 
 def load_channels() -> None:
+    """Load channels from DB. Auto-cleanup if FORCE_CLEAN_CHANNELS = True."""
     global _REQUIRED_CHANNELS
+
+    # ⭐ Auto-cleanup: sirf DEFAULT_CHANNELS wale rakho
+    if FORCE_CLEAN_CHANNELS:
+        default_usernames = {ch["username"] for ch in DEFAULT_CHANNELS}
+        rows = db_list_channels()
+        for r in rows:
+            if r["username"] not in default_usernames:
+                log.info("🧹 Removing old channel from DB: %s", r["username"])
+                db_remove_channel(r["username"])
+
     rows = db_list_channels()
+
+    # Seed defaults if empty
     if not rows:
         for ch in DEFAULT_CHANNELS:
             db_add_channel(ch["username"], ch["name"], ch["url"], None)
@@ -189,7 +214,9 @@ def load_channels() -> None:
         {"username": r["username"], "name": r["name"], "url": r["url"]}
         for r in rows
     ]
-    log.info("Loaded %d required channel(s)", len(_REQUIRED_CHANNELS))
+    log.info("Loaded %d required channel(s): %s",
+             len(_REQUIRED_CHANNELS),
+             [c["username"] for c in _REQUIRED_CHANNELS])
 
 
 # ------------------- Users / Codes -------------------
@@ -655,29 +682,46 @@ async def check_missing_channels(context: ContextTypes.DEFAULT_TYPE,
 
 async def _reply(update: Update, text: str,
                  reply_markup=None, prefer_edit: bool = False) -> None:
-    """Universal reply — works for messages AND callback queries."""
+    """Universal reply — works for messages AND callback queries.
+    Falls back to plain text if Markdown parsing fails."""
     try:
         cq = update.callback_query
+        target = None
+        use_edit = False
+
         if cq and cq.message:
-            if prefer_edit:
-                try:
-                    await cq.message.edit_text(
-                        text, parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=reply_markup,
-                        disable_web_page_preview=True)
-                    return
-                except Exception:
-                    pass
-            await cq.message.reply_text(
+            target = cq.message
+            use_edit = prefer_edit
+        elif update.message:
+            target = update.message
+        else:
+            log.warning("_reply: no target for update")
+            return
+
+        if use_edit:
+            try:
+                await target.edit_text(
+                    text, parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True)
+                return
+            except Exception as e:
+                log.debug("edit_text failed, will reply: %s", e)
+
+        try:
+            await target.reply_text(
                 text, parse_mode=ParseMode.MARKDOWN,
                 reply_markup=reply_markup,
                 disable_web_page_preview=True)
             return
-        if update.message:
-            await update.message.reply_text(
-                text, parse_mode=ParseMode.MARKDOWN,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True)
+        except Exception as md_err:
+            log.warning("Markdown failed, sending plain text: %s", md_err)
+
+        try:
+            await target.reply_text(text, reply_markup=reply_markup)
+        except Exception as e:
+            log.exception("Plain reply also failed: %s", e)
+
     except Exception as e:
         log.exception("_reply failed: %s", e)
 
@@ -757,7 +801,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text += ("\n\n*Admin:*\n`/admin` `/newcode` `/addcredits` "
                  "`/revoke` `/codes` `/users` `/logs` `/stats`\n"
                  "`/addchannel` `/removechannel` `/channels` `/debugchannels`")
-    # ⭐ FIX: use _reply instead of update.message
     await _reply(update, text, reply_markup=main_menu(is_admin(uid)))
 
 
@@ -791,7 +834,6 @@ async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 @require_channels
 async def cmd_credits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ⭐ FIX: use _reply instead of update.message
     touch_user(update)
     uid = update.effective_user.id
     bal = get_credits(uid)
@@ -807,7 +849,6 @@ async def cmd_credits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 @require_channels
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ⭐ FIX: use _reply instead of update.message
     touch_user(update)
     uid = update.effective_user.id
     info = user_active_key_info(uid)
@@ -1010,7 +1051,10 @@ def admin_only(func):
         u = update.effective_user
         if u is None or not is_admin(u.id):
             if update.callback_query:
-                await update.callback_query.answer("⛔ Unauthorized", show_alert=True)
+                try:
+                    await update.callback_query.answer("⛔ Unauthorized", show_alert=True)
+                except Exception:
+                    pass
             elif update.message:
                 await update.message.reply_text("⛔ Unauthorized.")
             return
@@ -1053,8 +1097,6 @@ async def cmd_addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "`/addchannel @mychannel My Channel`\n"
             "`/addchannel @mychannel My Channel https://t.me/mychannel`\n"
             "`/addchannel -1001234567890 Private Group https://t.me/+abc123`\n\n"
-            "ℹ️ Public channels: `@username`\n"
-            "ℹ️ Private groups: numeric ID (e.g. `-1001234567890`)\n\n"
             "⚠️ Bot ko us channel/group me *admin* banana zaroori hai.")
         return
 
@@ -1120,6 +1162,20 @@ async def cmd_removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await _reply(update,
         f"✅ Removed: `{username}`\n\n"
         f"📊 Total required: `{len(_REQUIRED_CHANNELS)}`")
+
+
+@admin_only
+async def cmd_clearchannels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force remove ALL channels and reset to defaults."""
+    n = db_clear_channels()
+    for ch in DEFAULT_CHANNELS:
+        db_add_channel(ch["username"], ch["name"], ch["url"], None)
+    load_channels()
+    await _reply(update,
+        f"🧹 *Channels Cleared*\n\n"
+        f"Removed: `{n}` old channels\n"
+        f"Reset to: `{len(_REQUIRED_CHANNELS)}` default channel(s)\n\n"
+        f"📢 Active: `{_REQUIRED_CHANNELS[0]['username'] if _REQUIRED_CHANNELS else 'None'}`")
 
 
 @admin_only
@@ -1358,111 +1414,151 @@ async def gen_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===========================================================================
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    if q is None:
+        return
+
     data = q.data or ""
-    uid = update.effective_user.id
+    uid = update.effective_user.id if update.effective_user else 0
     log.info("callback: %s from %s", data, uid)
 
-    # Always answer first to prevent "loading" spinner
     try:
         await q.answer()
     except Exception:
         pass
 
-    # Verify FIRST
-    if data == "u:verify":
-        touch_user(update)
-        await cmd_verify(update, context)
-        return
+    try:
+        # ---------- VERIFY BUTTON ----------
+        if data == "u:verify":
+            touch_user(update)
+            await cmd_verify(update, context)
+            return
 
-    # Admin callbacks
-    if data.startswith("a:"):
+        # ---------- ADMIN CALLBACKS ----------
+        if data.startswith("a:"):
+            if not is_admin(uid):
+                try:
+                    await q.answer("⛔ Unauthorized", show_alert=True)
+                except Exception:
+                    pass
+                return
+            touch_user(update)
+
+            if data == "a:panel":
+                await cmd_admin(update, context)
+
+            elif data == "a:codes":
+                await cmd_codes(update, context)
+
+            elif data == "a:revoke":
+                await _reply(update,
+                    "🚫 *Revoke Key*\n\nUse: `/revoke ICH-XXXX-XXXX`")
+
+            elif data == "a:users":
+                await cmd_users(update, context)
+
+            elif data == "a:addcredits":
+                await _reply(update,
+                    "💎 *Add Credits*\n\nUse: `/addcredits USER_ID AMOUNT`\n"
+                    "Example: `/addcredits 8250721152 10`")
+
+            elif data == "a:logs":
+                await cmd_logs(update, context)
+
+            elif data == "a:stats":
+                await cmd_stats(update, context)
+
+            elif data == "a:debug":
+                await cmd_debugchannels(update, context)
+
+            elif data == "a:channels_menu":
+                text = ("📢 *Manage Required Channels*\n\n"
+                        f"Currently active: `{len(_REQUIRED_CHANNELS)}`\n\n"
+                        "➕ Add channel/group\n"
+                        "➖ Remove channel/group\n"
+                        "📋 View full list")
+                await edit_admin_text(update, text, reply_markup=channels_admin_menu())
+
+            elif data == "a:addch_hint":
+                await _reply(update,
+                    "➕ *Add Channel/Group*\n\n"
+                    "Use command:\n"
+                    "`/addchannel @username Display Name`\n\n"
+                    "*Examples:*\n"
+                    "`/addchannel @mychannel My Channel`\n"
+                    "`/addchannel @mychannel My Channel https://t.me/mychannel`\n"
+                    "`/addchannel -1001234567890 Private Group https://t.me/+abc123`\n\n"
+                    "⚠️ Bot ko us channel/group me *admin* banana zaroori hai.")
+
+            elif data == "a:removech_hint":
+                await _reply(update,
+                    "➖ *Remove Channel*\n\n"
+                    "Use command:\n"
+                    "`/removechannel @username`\n\n"
+                    "Example: `/removechannel @mychannel`\n\n"
+                    "📋 Full list: `/channels`")
+
+            elif data == "a:listchannels":
+                await cmd_channels(update, context)
+
+            elif data == "a:back":
+                text = "🏠 *Main Menu*\n\nNumber bhejo ya menu use karo 👇"
+                try:
+                    await q.message.edit_text(
+                        text, parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=main_menu(is_admin(uid)))
+                except Exception:
+                    await _reply(update, text,
+                                 reply_markup=main_menu(is_admin(uid)))
+
+            else:
+                log.warning("Unknown admin callback: %s", data)
+            return
+
+        # ---------- USER CALLBACKS ----------
+        touch_user(update)
+
         if not is_admin(uid):
+            missing = await check_missing_channels(context, uid)
+            if missing:
+                await send_join_prompt(update, context)
+                return
+
+        if data == "u:howlookup":
+            await _reply(update,
+                "📱 *Kaise lookup karein:*\n\n"
+                "1️⃣ Pehle access key activate karo:\n`/activate ICH-XXXX-XXXX`\n\n"
+                "2️⃣ Phir number bhejo:\n`9876543210`\n`+919876543210`\n\n"
+                "Ya `/lookup 9876543210` bhi chalta hai.")
+
+        elif data == "u:activate":
+            await _reply(update,
+                f"Apna key bhejo:\n`/activate ICH-ABCD-1234`\n\n{contact_block()}")
+
+        elif data == "u:status":
+            await cmd_status(update, context)
+
+        elif data == "u:credits":
+            await cmd_credits(update, context)
+
+        elif data == "u:help":
+            await cmd_help(update, context)
+
+        else:
+            log.warning("Unknown user callback: %s", data)
+
+    except Exception as e:
+        log.exception("on_callback FATAL error for data=%s: %s", data, e)
+        try:
+            if q.message:
+                await q.message.reply_text(
+                    f"⚠️ *Error:* `{str(e)[:200]}`",
+                    parse_mode=ParseMode.MARKDOWN)
+        except Exception:
             try:
-                await q.answer("⛔ Unauthorized", show_alert=True)
+                if q.message:
+                    await q.message.reply_text(f"⚠️ Error: {str(e)[:200]}")
             except Exception:
                 pass
-            return
-        touch_user(update)
-
-        if data == "a:panel":
-            await cmd_admin(update, context)
-        elif data == "a:codes":
-            await cmd_codes(update, context)
-        elif data == "a:revoke":
-            await _reply(update,
-                "🚫 *Revoke Key*\n\nUse: `/revoke ICH-XXXX-XXXX`")
-        elif data == "a:users":
-            await cmd_users(update, context)
-        elif data == "a:addcredits":
-            await _reply(update,
-                "💎 *Add Credits*\n\nUse: `/addcredits USER_ID AMOUNT`\n"
-                "Example: `/addcredits 8250721152 10`")
-        elif data == "a:logs":
-            await cmd_logs(update, context)
-        elif data == "a:stats":
-            await cmd_stats(update, context)
-        elif data == "a:debug":
-            await cmd_debugchannels(update, context)
-        elif data == "a:channels_menu":
-            text = ("📢 *Manage Required Channels*\n\n"
-                    f"Currently active: `{len(_REQUIRED_CHANNELS)}`\n\n"
-                    "➕ Add channel/group\n"
-                    "➖ Remove channel/group\n"
-                    "📋 View full list")
-            await edit_admin_text(update, text, reply_markup=channels_admin_menu())
-        elif data == "a:addch_hint":
-            await _reply(update,
-                "➕ *Add Channel/Group*\n\n"
-                "Use command:\n"
-                "`/addchannel @username Display Name`\n\n"
-                "*Examples:*\n"
-                "`/addchannel @mychannel My Channel`\n"
-                "`/addchannel @mychannel My Channel https://t.me/mychannel`\n"
-                "`/addchannel -1001234567890 Private Group https://t.me/+abc123`\n\n"
-                "⚠️ Bot ko us channel/group me *admin* banana zaroori hai.")
-        elif data == "a:removech_hint":
-            await _reply(update,
-                "➖ *Remove Channel*\n\n"
-                "Use command:\n"
-                "`/removechannel @username`\n\n"
-                "Example: `/removechannel @mychannel`\n\n"
-                "📋 Full list dekhne ke liye: `/channels`")
-        elif data == "a:listchannels":
-            await cmd_channels(update, context)
-        elif data == "a:back":
-            text = "🏠 *Main Menu*\n\nNumber bhejo ya menu use karo 👇"
-            try:
-                await q.message.edit_text(
-                    text, parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=main_menu(is_admin(uid)))
-            except Exception:
-                await _reply(update, text, reply_markup=main_menu(is_admin(uid)))
-        return
-
-    # User callbacks — strict channel gate
-    touch_user(update)
-
-    if not is_admin(uid):
-        missing = await check_missing_channels(context, uid)
-        if missing:
-            await send_join_prompt(update, context)
-            return
-
-    if data == "u:howlookup":
-        await _reply(update,
-            "📱 *Kaise lookup karein:*\n\n"
-            "1️⃣ Pehle access key activate karo:\n`/activate ICH-XXXX-XXXX`\n\n"
-            "2️⃣ Phir number bhejo:\n`9876543210`\n`+919876543210`\n\n"
-            "Ya `/lookup 9876543210` bhi chalta hai.")
-    elif data == "u:activate":
-        await _reply(update,
-            f"Apna key bhejo:\n`/activate ICH-ABCD-1234`\n\n{contact_block()}")
-    elif data == "u:status":
-        await cmd_status(update, context)
-    elif data == "u:credits":
-        await cmd_credits(update, context)
-    elif data == "u:help":
-        await cmd_help(update, context)
 
 
 # ===========================================================================
@@ -1515,6 +1611,7 @@ async def run() -> None:
     app.add_handler(CommandHandler("addchannel", cmd_addchannel))
     app.add_handler(CommandHandler("removechannel", cmd_removechannel))
     app.add_handler(CommandHandler("channels", cmd_channels))
+    app.add_handler(CommandHandler("clearchannels", cmd_clearchannels))  # ⭐ NEW
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_message))
