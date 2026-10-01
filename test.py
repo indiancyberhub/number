@@ -1,6 +1,6 @@
 """
-Indian Cyber Hub - OSINT Bot (Working Channel Gate)
-Run: python bot.py
+Indian Cyber Hub - OSINT Bot (All Buttons Working)
+Run: python test.py
 """
 from __future__ import annotations
 
@@ -58,15 +58,11 @@ SHOW_RAW_API_RESPONSE = True
 
 HIDDEN_API_KEYS = {"expiry_date", "days_left", "developer", "updates"}
 
-# 📢 Required channels (user must join ALL to use bot)
-REQUIRED_CHANNELS = [
+DEFAULT_CHANNELS = [
     {"username": "@indiancyberhub24", "name": "Indian Cyber Hub", "url": "https://t.me/indiancyberhub24"},
-    {"username": "@rootrats",         "name": "Root Rats",         "url": "https://t.me/rootrats"},
-    {"username": "@apk_hub_24",       "name": "APK Hub",           "url": "https://t.me/apk_hub_24"},
-    {"username": "@x_dark_data",      "name": "X Dark Data",       "url": "https://t.me/x_dark_data"},
-    {"username": "@darkosinteapi",    "name": "Dark OSINT API",    "url": "https://t.me/darkosinteapi"},
-    {"username": "@i_c_h_chat",       "name": "ICH Chat",          "url": "https://t.me/i_c_h_chat"},
 ]
+
+_REQUIRED_CHANNELS: list[dict] = []
 
 _VALID_MEMBER_STATUSES = {"creator", "administrator", "member"}
 
@@ -146,13 +142,57 @@ def init_db() -> None:
                 user_id   INTEGER NOT NULL,
                 timestamp TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS verified_users (
-                user_id       INTEGER PRIMARY KEY,
-                verified_at   TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS required_channels (
+                username TEXT PRIMARY KEY,
+                name     TEXT NOT NULL,
+                url      TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                added_by INTEGER
             );
         """)
 
 
+def db_add_channel(username: str, name: str, url: str, added_by: Optional[int] = None) -> bool:
+    try:
+        with _conn() as c:
+            c.execute("""
+                INSERT INTO required_channels (username, name, url, added_at, added_by)
+                VALUES (?, ?, ?, ?, ?)
+            """, (username, name, url, _iso(_now()), added_by))
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def db_remove_channel(username: str) -> bool:
+    with _conn() as c:
+        cur = c.execute("DELETE FROM required_channels WHERE username = ?", (username,))
+        return cur.rowcount > 0
+
+
+def db_list_channels() -> list:
+    with _conn() as c:
+        return c.execute(
+            "SELECT username, name, url, added_at FROM required_channels ORDER BY added_at"
+        ).fetchall()
+
+
+def load_channels() -> None:
+    global _REQUIRED_CHANNELS
+    rows = db_list_channels()
+    if not rows:
+        for ch in DEFAULT_CHANNELS:
+            db_add_channel(ch["username"], ch["name"], ch["url"], None)
+        rows = db_list_channels()
+
+    _REQUIRED_CHANNELS = [
+        {"username": r["username"], "name": r["name"], "url": r["url"]}
+        for r in rows
+    ]
+    log.info("Loaded %d required channel(s)", len(_REQUIRED_CHANNELS))
+
+
+# ------------------- Users / Codes -------------------
 def upsert_user(user_id: int, username: str) -> None:
     now = _iso(_now())
     with _conn() as c:
@@ -195,29 +235,6 @@ def list_users(limit: int = 50) -> list:
         return c.execute(
             "SELECT user_id, username, last_seen, credits FROM users "
             "ORDER BY last_seen DESC LIMIT ?", (limit,)).fetchall()
-
-
-def is_verified(user_id: int) -> bool:
-    """Check if user has passed channel verification recently (last 24h)."""
-    cutoff = _iso(_now() - timedelta(hours=24))
-    with _conn() as c:
-        row = c.execute(
-            "SELECT 1 FROM verified_users WHERE user_id = ? AND verified_at >= ?",
-            (user_id, cutoff)).fetchone()
-        return row is not None
-
-
-def mark_verified(user_id: int) -> None:
-    with _conn() as c:
-        c.execute("""
-            INSERT INTO verified_users (user_id, verified_at) VALUES (?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET verified_at = excluded.verified_at
-        """, (user_id, _iso(_now())))
-
-
-def unmark_verified(user_id: int) -> None:
-    with _conn() as c:
-        c.execute("DELETE FROM verified_users WHERE user_id = ?", (user_id,))
 
 
 _ALPHABET = string.ascii_uppercase + string.digits
@@ -387,7 +404,8 @@ def get_stats() -> dict:
             "SELECT COUNT(*) AS n FROM lookup_logs WHERE timestamp >= ?",
             (day_ago,)).fetchone()["n"]
     return {"users": users, "total_codes": total_codes, "active_codes": active_codes,
-            "lookups": lookups, "lookups_ok": lookups_ok, "lookups_24h": lookups_24h}
+            "lookups": lookups, "lookups_ok": lookups_ok, "lookups_24h": lookups_24h,
+            "channels": len(_REQUIRED_CHANNELS)}
 
 
 # ===========================================================================
@@ -541,8 +559,18 @@ def admin_menu() -> InlineKeyboardMarkup:
          InlineKeyboardButton("💎 Add Credits", callback_data="a:addcredits")],
         [InlineKeyboardButton("🔎 Lookup Logs", callback_data="a:logs"),
          InlineKeyboardButton("📊 Statistics", callback_data="a:stats")],
+        [InlineKeyboardButton("📢 Manage Channels", callback_data="a:channels_menu")],
         [InlineKeyboardButton("📡 Debug Channels", callback_data="a:debug")],
         [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="a:back")],
+    ])
+
+
+def channels_admin_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Channel/Group", callback_data="a:addch_hint")],
+        [InlineKeyboardButton("➖ Remove Channel", callback_data="a:removech_hint")],
+        [InlineKeyboardButton("📋 List Channels", callback_data="a:listchannels")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="a:panel")],
     ])
 
 
@@ -567,14 +595,8 @@ def check_access(user_id: int):
 # ===========================================================================
 def channels_join_keyboard() -> InlineKeyboardMarkup:
     rows = []
-    pair = []
-    for ch in REQUIRED_CHANNELS:
-        pair.append(InlineKeyboardButton(f"📢 {ch['name']}", url=ch["url"]))
-        if len(pair) == 2:
-            rows.append(pair)
-            pair = []
-    if pair:
-        rows.append(pair)
+    for ch in _REQUIRED_CHANNELS:
+        rows.append([InlineKeyboardButton(f"📢 Join {ch['name']}", url=ch["url"])])
     rows.append([InlineKeyboardButton("✅ Verify / Main Menu", callback_data="u:verify")])
     return InlineKeyboardMarkup(rows)
 
@@ -583,10 +605,10 @@ def channels_join_text() -> str:
     lines = [
         "🔐 *Access Restricted*",
         "",
-        "Bot use karne ke liye pehle niche diye gaye *saare channels* join karo:",
+        "Bot use karne ke liye pehle niche diye gaye *channel(s)/group(s)* join karo:",
         "",
     ]
-    for ch in REQUIRED_CHANNELS:
+    for ch in _REQUIRED_CHANNELS:
         lines.append(f"📢 [{ch['name']}]({ch['url']})")
     lines += [
         "",
@@ -599,16 +621,12 @@ def channels_join_text() -> str:
 
 async def check_missing_channels(context: ContextTypes.DEFAULT_TYPE,
                                   user_id: int) -> list[str]:
-    """
-    Returns list of channel names user has NOT joined.
+    if not _REQUIRED_CHANNELS:
+        return []
 
-    SUPER LENIENT: agar check fail ho jaye (bot admin nahi, chat not found,
-    network issue, etc.) toh user ko ALLOW kar dete hain.
-    Sirf tab block karte hain jab Telegram EXPLICITLY bole "left"/"kicked".
-    """
     missing: list[str] = []
 
-    for ch in REQUIRED_CHANNELS:
+    for ch in _REQUIRED_CHANNELS:
         try:
             member = await context.bot.get_chat_member(
                 chat_id=ch["username"], user_id=user_id)
@@ -618,23 +636,19 @@ async def check_missing_channels(context: ContextTypes.DEFAULT_TYPE,
                 status = status.value
             status = str(status).lower().strip()
 
-            log.info("✅ %s → user %s = %s", ch["username"], user_id, status)
+            log.info("Channel %s → user %s = %s", ch["username"], user_id, status)
 
-            if status in ("left", "kicked"):
-                missing.append(ch["name"])
-            elif status == "restricted":
-                if not getattr(member, "is_member", False):
-                    missing.append(ch["name"])
-            # 'creator', 'administrator', 'member' → OK
-            # unknown → allow
+            if status in ("creator", "administrator", "member"):
+                continue
+            if status == "restricted" and getattr(member, "is_member", False):
+                continue
+
+            missing.append(ch["name"])
 
         except Exception as e:
-            # ANY error → ALLOW user through (fail-open)
-            # Reason: bot admin nahi hai toh check fail hoga. User ko
-            # block karna galat hoga agar woh genuinely joined hai.
-            log.warning("⚠️ %s check FAILED → allowing user. Err: %s",
+            log.warning("Channel check FAILED [%s] → marking missing. Err: %s",
                         ch["username"], str(e)[:150])
-            continue
+            missing.append(ch["name"])
 
     return missing
 
@@ -680,12 +694,7 @@ def require_channels(func):
         if u is None:
             return
 
-        # Admins bypass
         if is_admin(u.id):
-            return await func(update, context, *a, **kw)
-
-        # Already verified in last 24h? Skip check (smooth UX)
-        if is_verified(u.id):
             return await func(update, context, *a, **kw)
 
         missing = await check_missing_channels(context, u.id)
@@ -693,8 +702,6 @@ def require_channels(func):
             await send_join_prompt(update, context)
             return
 
-        # All good — mark verified so we don't re-check every message
-        mark_verified(u.id)
         return await func(update, context, *a, **kw)
 
     return wrapper
@@ -713,10 +720,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     admin_flag = "🛡 *You are an ADMIN.*\n\n" if is_admin(uid) else ""
 
     if not allowed and not is_admin(uid):
-        await update.message.reply_text(
+        await _reply(update,
             "👋 *Welcome to Indian Cyber Hub – Authorized OSINT Bot*\n\n"
             f"{admin_flag}{access_denied_text(reason)}",
-            parse_mode=ParseMode.MARKDOWN,
             reply_markup=main_menu(is_admin(uid)))
         return
 
@@ -732,9 +738,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "• /help – help")
     if is_admin(uid):
         text += "\n\n🛡 `/admin` – Admin Panel"
-    await update.message.reply_text(
-        text, parse_mode=ParseMode.MARKDOWN,
-        reply_markup=main_menu(is_admin(uid)))
+    await _reply(update, text, reply_markup=main_menu(is_admin(uid)))
 
 
 @require_channels
@@ -751,44 +755,43 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"{contact_block()}")
     if is_admin(uid):
         text += ("\n\n*Admin:*\n`/admin` `/newcode` `/addcredits` "
-                 "`/revoke` `/codes` `/users` `/logs` `/stats` `/debugchannels`")
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
-                                    reply_markup=main_menu(is_admin(uid)))
+                 "`/revoke` `/codes` `/users` `/logs` `/stats`\n"
+                 "`/addchannel` `/removechannel` `/channels` `/debugchannels`")
+    # ⭐ FIX: use _reply instead of update.message
+    await _reply(update, text, reply_markup=main_menu(is_admin(uid)))
 
 
 @require_channels
 async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     touch_user(update)
     if not context.args:
-        await update.message.reply_text(
-            f"Usage: `/activate ICH-XXXX-XXXX`\n\n{contact_block()}",
-            parse_mode=ParseMode.MARKDOWN)
+        await _reply(update,
+            f"Usage: `/activate ICH-XXXX-XXXX`\n\n{contact_block()}")
         return
 
     code = context.args[0].strip().upper()
     ok, info = activate_code(update.effective_user.id, code)
     if not ok:
-        await update.message.reply_text(
+        await _reply(update,
             f"❌ *Invalid Access Key*\n\nReason: {info}\n\n"
             "Possible reasons:\n• Key does not exist\n• Key expired\n"
             "• Key revoked\n• Max uses reached\n• Already activated\n\n"
-            f"{contact_block()}",
-            parse_mode=ParseMode.MARKDOWN)
+            f"{contact_block()}")
         return
 
     exp_str = info["expires_at"].strftime("%Y-%m-%d %H:%M UTC")
-    await update.message.reply_text(
+    await _reply(update,
         "✅ *Access Activated*\n\n"
         f"🔑 Key: `{info['code']}`\n"
         f"♾ Mode: *Unlimited lookups*\n"
         f"⏳ Valid until: `{exp_str}`\n\n"
         "Ab aap **unlimited** `/lookup NUMBER` kar sakte ho.",
-        parse_mode=ParseMode.MARKDOWN,
         reply_markup=main_menu(is_admin(update.effective_user.id)))
 
 
 @require_channels
 async def cmd_credits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # ⭐ FIX: use _reply instead of update.message
     touch_user(update)
     uid = update.effective_user.id
     bal = get_credits(uid)
@@ -799,12 +802,12 @@ async def cmd_credits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         text = f"💎 Credits: *{bal}*\n♾ *Unlimited* (active key ke saath)"
     else:
         text = f"💎 Credits: *{bal}*\n\nEk lookup = 1 credit."
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
-                                    reply_markup=main_menu(is_admin(uid)))
+    await _reply(update, text, reply_markup=main_menu(is_admin(uid)))
 
 
 @require_channels
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # ⭐ FIX: use _reply instead of update.message
     touch_user(update)
     uid = update.effective_user.id
     info = user_active_key_info(uid)
@@ -823,20 +826,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"🛡 Admin: `{'Yes' if is_admin(uid) else 'No'}`")
     if not allowed:
         text += f"\n\n_{reason}_"
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
-                                    reply_markup=main_menu(is_admin(uid)))
+    await _reply(update, text, reply_markup=main_menu(is_admin(uid)))
 
 
 async def cmd_verify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles both /verify command AND ✅ Verify button callback."""
     u = update.effective_user
     if u is None:
         return
     touch_user(update)
 
-    # Admin bypass
     if is_admin(u.id):
-        mark_verified(u.id)
         await _reply(update, "✅ Welcome back, admin!",
                      reply_markup=main_menu(True))
         return
@@ -845,15 +844,13 @@ async def cmd_verify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if missing:
         text = (
             "⚠️ *Verification Pending*\n\n"
-            "Abhi ye channels join karna baaki hai:\n\n"
+            "Abhi ye channel(s)/group(s) join karna baaki hai:\n\n"
             + "\n".join(f"• {m}" for m in missing)
-            + "\n\n👆 Join karke *✅ Verify* dobara dabao."
+            + "\n\n👇 Join karke *✅ Verify* dobara dabao."
         )
         await _reply(update, text, reply_markup=channels_join_keyboard())
         return
 
-    # Success — mark verified
-    mark_verified(u.id)
     await _reply(update,
                  "✅ *Verified Successfully!*\n\n"
                  "Ab aap bot use kar sakte ho.\n\n"
@@ -961,14 +958,12 @@ async def do_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, number: 
 async def cmd_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     touch_user(update)
     if not context.args:
-        await update.message.reply_text(
-            "Usage: `/lookup 9876543210`\n\nYa direct number bhi bhej sakte ho.",
-            parse_mode=ParseMode.MARKDOWN)
+        await _reply(update,
+            "Usage: `/lookup 9876543210`\n\nYa direct number bhi bhej sakte ho.")
         return
     number = validate_number(context.args[0])
     if not number:
-        await update.message.reply_text("❌ Invalid number. Example: `9876543210`",
-                                        parse_mode=ParseMode.MARKDOWN)
+        await _reply(update, "❌ Invalid number. Example: `9876543210`")
         return
     await do_lookup(update, context, number)
 
@@ -980,14 +975,13 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not text or text.startswith("/"):
         return
     if not looks_like_number(text):
-        await update.message.reply_text(
+        await _reply(update,
             "🤔 Ye number nahi lagta.\n\nNumber bhejo aise:\n"
-            "`9876543210`\n`+919876543210`",
-            parse_mode=ParseMode.MARKDOWN)
+            "`9876543210`\n`+919876543210`")
         return
     number = validate_number(text)
     if not number:
-        await update.message.reply_text("❌ Number format galat hai.")
+        await _reply(update, "❌ Number format galat hai.")
         return
     await do_lookup(update, context, number)
 
@@ -996,12 +990,7 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ADMIN
 # ===========================================================================
 async def send_admin_text(update: Update, text: str, reply_markup=None) -> None:
-    if update.message:
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
-                                        reply_markup=reply_markup)
-    elif update.callback_query and update.callback_query.message:
-        await update.callback_query.message.reply_text(
-            text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+    await _reply(update, text, reply_markup=reply_markup)
 
 
 async def edit_admin_text(update: Update, text: str, reply_markup=None) -> None:
@@ -1012,7 +1001,7 @@ async def edit_admin_text(update: Update, text: str, reply_markup=None) -> None:
             return
         except Exception as e:
             log.warning("edit failed: %s", e)
-    await send_admin_text(update, text, reply_markup=reply_markup)
+    await _reply(update, text, reply_markup=reply_markup)
 
 
 def admin_only(func):
@@ -1020,10 +1009,10 @@ def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u = update.effective_user
         if u is None or not is_admin(u.id):
-            if update.message:
-                await update.message.reply_text("⛔ Unauthorized.")
-            elif update.callback_query:
+            if update.callback_query:
                 await update.callback_query.answer("⛔ Unauthorized", show_alert=True)
+            elif update.message:
+                await update.message.reply_text("⛔ Unauthorized.")
             return
         touch_user(update)
         return await func(update, context)
@@ -1034,25 +1023,130 @@ def admin_only(func):
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = ("🛡 *ADMIN PANEL*\n\n"
             f"👑 Owner ID: `{OWNER_ID}`\n"
-            f"👥 Admins: `{len(ADMIN_IDS)}`\n\n"
+            f"👥 Admins: `{len(ADMIN_IDS)}`\n"
+            f"📢 Required Channels: `{len(_REQUIRED_CHANNELS)}`\n\n"
             "🎟 Generate Access Key\n📋 Active Keys\n🚫 Revoke Key\n"
-            "👥 Users\n💎 Add Credits\n🔎 Lookup Logs\n📊 Statistics\n\n"
+            "👥 Users\n💎 Add Credits\n🔎 Lookup Logs\n📊 Statistics\n"
+            "📢 Manage Channels\n\n"
             "*Commands*\n"
             "`/newcode [hours] [uses] [credits]`\n"
             "`/addcredits USER_ID AMOUNT`\n"
-            "`/revoke CODE`\n`/codes`\n`/users`\n`/logs`\n`/stats`\n"
-            "`/debugchannels` – bot admin status check\n"
-            "`/unverify USER_ID` – user ka verification reset")
+            "`/revoke CODE`\n"
+            "`/addchannel @username Display Name`\n"
+            "`/removechannel @username`\n"
+            "`/channels` – list required channels\n"
+            "`/codes` `/users` `/logs` `/stats` `/debugchannels`")
     if update.callback_query:
         await edit_admin_text(update, text, reply_markup=admin_menu())
     else:
-        await send_admin_text(update, text, reply_markup=admin_menu())
+        await _reply(update, text, reply_markup=admin_menu())
+
+
+@admin_only
+async def cmd_addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    if len(args) < 2:
+        await _reply(update,
+            "📢 *Add Channel/Group*\n\n"
+            "Usage: `/addchannel <username_or_id> <display name> [url]`\n\n"
+            "*Examples:*\n"
+            "`/addchannel @mychannel My Channel`\n"
+            "`/addchannel @mychannel My Channel https://t.me/mychannel`\n"
+            "`/addchannel -1001234567890 Private Group https://t.me/+abc123`\n\n"
+            "ℹ️ Public channels: `@username`\n"
+            "ℹ️ Private groups: numeric ID (e.g. `-1001234567890`)\n\n"
+            "⚠️ Bot ko us channel/group me *admin* banana zaroori hai.")
+        return
+
+    raw_username = args[0].strip()
+    url = None
+    if len(args) >= 3 and args[-1].startswith("http"):
+        url = args[-1]
+        name = " ".join(args[1:-1]).strip()
+    else:
+        name = " ".join(args[1:]).strip()
+
+    if raw_username.startswith(("@", "+", "-")):
+        username = raw_username
+    elif raw_username.isdigit() or (raw_username.startswith("-") and raw_username[1:].isdigit()):
+        username = raw_username
+    else:
+        username = "@" + raw_username
+
+    if not url:
+        if username.startswith("@"):
+            url = f"https://t.me/{username.lstrip('@')}"
+        else:
+            url = "https://t.me/"
+
+    if not name:
+        await _reply(update, "❌ Display name required.")
+        return
+
+    ok = db_add_channel(username, name, url, update.effective_user.id)
+    if not ok:
+        await _reply(update,
+            f"❌ Channel `{username}` already exists.\n\n"
+            f"Remove first: `/removechannel {username}`")
+        return
+
+    load_channels()
+    await _reply(update,
+        "✅ *Channel Added*\n\n"
+        f"📢 Name: {name}\n"
+        f"🆔 ID: `{username}`\n"
+        f"🔗 URL: {url}\n\n"
+        f"📊 Total required: `{len(_REQUIRED_CHANNELS)}`\n\n"
+        "ℹ️ Ab is channel me bot ko *admin* banao.")
+
+
+@admin_only
+async def cmd_removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await _reply(update,
+            "Usage: `/removechannel @username`\n"
+            "Example: `/removechannel @mychannel`")
+        return
+
+    raw = context.args[0].strip()
+    username = raw if raw.startswith(("@", "+", "-")) else "@" + raw
+
+    ok = db_remove_channel(username)
+    if not ok:
+        await _reply(update, f"❌ Not found: `{username}`")
+        return
+
+    load_channels()
+    await _reply(update,
+        f"✅ Removed: `{username}`\n\n"
+        f"📊 Total required: `{len(_REQUIRED_CHANNELS)}`")
+
+
+@admin_only
+async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _REQUIRED_CHANNELS:
+        await _reply(update,
+            "📢 *No required channels.*\n\n"
+            "Add one: `/addchannel @username Display Name`")
+        return
+
+    lines = [f"📢 *Required Channels* ({len(_REQUIRED_CHANNELS)})", ""]
+    for i, ch in enumerate(_REQUIRED_CHANNELS, 1):
+        lines.append(f"{i}. {ch['name']}\n   `{ch['username']}`\n   {ch['url']}")
+    lines.append("")
+    lines.append("➕ Add: `/addchannel @username Name`")
+    lines.append("➖ Remove: `/removechannel @username`")
+    await _reply(update, "\n".join(lines))
 
 
 @admin_only
 async def cmd_debugchannels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _REQUIRED_CHANNELS:
+        await _reply(update, "📢 No required channels configured.")
+        return
+
     lines = ["🔧 *Channel Debug*", ""]
-    for ch in REQUIRED_CHANNELS:
+    for ch in _REQUIRED_CHANNELS:
         try:
             me = await context.bot.get_chat_member(ch["username"], context.bot.id)
             bot_status = getattr(me, "status", "")
@@ -1070,19 +1164,7 @@ async def cmd_debugchannels(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             lines.append(f"❌ `{ch['username']}` — ERROR: {str(e)[:70]}")
     lines.append("")
     lines.append("ℹ️ ✅=OK, ⚠️=bot ko admin banao, ❌=username galat / bot add nahi hai")
-    await send_admin_text(update, "\n".join(lines))
-
-
-@admin_only
-async def cmd_unverify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await send_admin_text(update, "Usage: `/unverify USER_ID`"); return
-    try:
-        target = int(context.args[0])
-    except ValueError:
-        await send_admin_text(update, "User ID number do."); return
-    unmark_verified(target)
-    await send_admin_text(update, f"✅ User `{target}` ka verification reset ho gaya.")
+    await _reply(update, "\n".join(lines))
 
 
 @admin_only
@@ -1094,20 +1176,20 @@ async def cmd_newcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if len(args) >= 2: uses = int(args[1])
         if len(args) >= 3: credits = int(args[2])
     except ValueError:
-        await send_admin_text(update,
+        await _reply(update,
             "Usage: `/newcode [hours] [uses] [credits]`\nExample: `/newcode 24 5 10`")
         return
     if not (1 <= hours <= 24 * 365 * 100):
-        await send_admin_text(update, "Hours: 1–876000"); return
+        await _reply(update, "Hours: 1–876000"); return
     if not (1 <= uses <= 10000):
-        await send_admin_text(update, "Uses: 1–10000"); return
+        await _reply(update, "Uses: 1–10000"); return
     if not (0 <= credits <= 100000):
-        await send_admin_text(update, "Credits: 0–100000"); return
+        await _reply(update, "Credits: 0–100000"); return
 
     code = create_code(hours=hours, max_uses=uses,
                        credits_per_use=credits,
                        created_by=update.effective_user.id)
-    await send_admin_text(update,
+    await _reply(update,
         "✅ *Access Key Generated*\n\n"
         f"🔑 Key:\n`{code}`\n\n"
         f"⏳ Validity: `{hours} hours`\n"
@@ -1120,74 +1202,75 @@ async def cmd_newcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 @admin_only
 async def cmd_addcredits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) < 2:
-        await send_admin_text(update,
+        await _reply(update,
             "Usage: `/addcredits USER_ID AMOUNT`\nExample: `/addcredits 8250721152 10`")
         return
     try:
         target = int(context.args[0]); amount = int(context.args[1])
     except ValueError:
-        await send_admin_text(update, "Numbers do."); return
+        await _reply(update, "Numbers do."); return
     if amount == 0:
-        await send_admin_text(update, "Amount 0 nahi."); return
+        await _reply(update, "Amount 0 nahi."); return
     new_bal = add_credits(target, amount)
-    await send_admin_text(update,
+    await _reply(update,
         f"✅ `{target}` ko `{amount:+d}` credits.\n💎 Balance: `{new_bal}`")
 
 
 @admin_only
 async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await send_admin_text(update, "Usage: `/revoke ICH-XXXX-XXXX`"); return
+        await _reply(update, "Usage: `/revoke ICH-XXXX-XXXX`"); return
     ok = revoke_code(context.args[0].strip().upper())
-    await send_admin_text(update, "✅ Revoked." if ok else "❌ Not found.")
+    await _reply(update, "✅ Revoked." if ok else "❌ Not found.")
 
 
 @admin_only
 async def cmd_codes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rows = list_codes(limit=30)
     if not rows:
-        await send_admin_text(update, "No keys. Use `/newcode 24 1 0`."); return
+        await _reply(update, "No keys. Use `/newcode 24 1 0`."); return
     lines = ["📋 *Recent Access Keys*", ""]
     for r in rows:
         icon = "✅" if (r["active"] and _code_is_valid(r)) else "❌"
         lines.append(f"`{r['code']}` – {r['uses']}/{r['max_uses']} – "
                      f"exp {r['expires_at'][:16]} – {icon}")
-    await send_admin_text(update, "\n".join(lines))
+    await _reply(update, "\n".join(lines))
 
 
 @admin_only
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rows = list_users(limit=50)
     if not rows:
-        await send_admin_text(update, "No users."); return
+        await _reply(update, "No users."); return
     lines = ["👥 *Recent Users*", ""]
     for r in rows:
         uname = f"@{r['username']}" if r["username"] else "—"
         lines.append(f"`{r['user_id']}` – {uname} – 💎{r['credits']} – {r['last_seen'][:16]}")
-    await send_admin_text(update, "\n".join(lines))
+    await _reply(update, "\n".join(lines))
 
 
 @admin_only
 async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rows = list_logs(limit=30)
     if not rows:
-        await send_admin_text(update, "No lookups."); return
+        await _reply(update, "No lookups."); return
     lines = ["🔎 *Recent Lookups*", ""]
     for r in rows:
         uname = f"@{r['username']}" if r["username"] else "—"
         lines.append(f"`{r['timestamp'][:16]}` – `{r['user_id']}` {uname} – "
                      f"`{r['query']}` – {r['status']}")
-    await send_admin_text(update, "\n".join(lines))
+    await _reply(update, "\n".join(lines))
 
 
 @admin_only
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = get_stats()
-    await send_admin_text(update,
+    await _reply(update,
         "📊 *Statistics*\n\n"
         f"Users: `{s['users']}`\n"
         f"Active keys: `{s['active_codes']}`\n"
         f"Total keys: `{s['total_codes']}`\n"
+        f"Required channels: `{s['channels']}`\n"
         f"Lookups (total): `{s['lookups']}`\n"
         f"Lookups (ok): `{s['lookups_ok']}`\n"
         f"Lookups (24h): `{s['lookups_24h']}`")
@@ -1279,9 +1362,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     uid = update.effective_user.id
     log.info("callback: %s from %s", data, uid)
 
+    # Always answer first to prevent "loading" spinner
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
     # Verify FIRST
     if data == "u:verify":
-        await q.answer()
         touch_user(update)
         await cmd_verify(update, context)
         return
@@ -1289,9 +1377,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Admin callbacks
     if data.startswith("a:"):
         if not is_admin(uid):
-            await q.answer("⛔ Unauthorized", show_alert=True)
+            try:
+                await q.answer("⛔ Unauthorized", show_alert=True)
+            except Exception:
+                pass
             return
-        await q.answer()
         touch_user(update)
 
         if data == "a:panel":
@@ -1299,55 +1389,74 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         elif data == "a:codes":
             await cmd_codes(update, context)
         elif data == "a:revoke":
-            await q.message.reply_text("🚫 *Revoke Key*\n\nUse: `/revoke ICH-XXXX-XXXX`",
-                                       parse_mode=ParseMode.MARKDOWN)
+            await _reply(update,
+                "🚫 *Revoke Key*\n\nUse: `/revoke ICH-XXXX-XXXX`")
         elif data == "a:users":
             await cmd_users(update, context)
         elif data == "a:addcredits":
-            await q.message.reply_text(
+            await _reply(update,
                 "💎 *Add Credits*\n\nUse: `/addcredits USER_ID AMOUNT`\n"
-                "Example: `/addcredits 8250721152 10`",
-                parse_mode=ParseMode.MARKDOWN)
+                "Example: `/addcredits 8250721152 10`")
         elif data == "a:logs":
             await cmd_logs(update, context)
         elif data == "a:stats":
             await cmd_stats(update, context)
         elif data == "a:debug":
             await cmd_debugchannels(update, context)
+        elif data == "a:channels_menu":
+            text = ("📢 *Manage Required Channels*\n\n"
+                    f"Currently active: `{len(_REQUIRED_CHANNELS)}`\n\n"
+                    "➕ Add channel/group\n"
+                    "➖ Remove channel/group\n"
+                    "📋 View full list")
+            await edit_admin_text(update, text, reply_markup=channels_admin_menu())
+        elif data == "a:addch_hint":
+            await _reply(update,
+                "➕ *Add Channel/Group*\n\n"
+                "Use command:\n"
+                "`/addchannel @username Display Name`\n\n"
+                "*Examples:*\n"
+                "`/addchannel @mychannel My Channel`\n"
+                "`/addchannel @mychannel My Channel https://t.me/mychannel`\n"
+                "`/addchannel -1001234567890 Private Group https://t.me/+abc123`\n\n"
+                "⚠️ Bot ko us channel/group me *admin* banana zaroori hai.")
+        elif data == "a:removech_hint":
+            await _reply(update,
+                "➖ *Remove Channel*\n\n"
+                "Use command:\n"
+                "`/removechannel @username`\n\n"
+                "Example: `/removechannel @mychannel`\n\n"
+                "📋 Full list dekhne ke liye: `/channels`")
+        elif data == "a:listchannels":
+            await cmd_channels(update, context)
         elif data == "a:back":
+            text = "🏠 *Main Menu*\n\nNumber bhejo ya menu use karo 👇"
             try:
                 await q.message.edit_text(
-                    "🏠 *Main Menu*\n\nNumber bhejo ya menu use karo 👇",
-                    parse_mode=ParseMode.MARKDOWN,
+                    text, parse_mode=ParseMode.MARKDOWN,
                     reply_markup=main_menu(is_admin(uid)))
             except Exception:
-                await q.message.reply_text("🏠 *Main Menu*",
-                                           parse_mode=ParseMode.MARKDOWN,
-                                           reply_markup=main_menu(is_admin(uid)))
+                await _reply(update, text, reply_markup=main_menu(is_admin(uid)))
         return
 
-    # User callbacks — check channel gate
-    await q.answer()
+    # User callbacks — strict channel gate
     touch_user(update)
 
-    if not is_verified(uid):
+    if not is_admin(uid):
         missing = await check_missing_channels(context, uid)
         if missing:
             await send_join_prompt(update, context)
             return
-        mark_verified(uid)
 
     if data == "u:howlookup":
-        await q.message.reply_text(
+        await _reply(update,
             "📱 *Kaise lookup karein:*\n\n"
             "1️⃣ Pehle access key activate karo:\n`/activate ICH-XXXX-XXXX`\n\n"
             "2️⃣ Phir number bhejo:\n`9876543210`\n`+919876543210`\n\n"
-            "Ya `/lookup 9876543210` bhi chalta hai.",
-            parse_mode=ParseMode.MARKDOWN)
+            "Ya `/lookup 9876543210` bhi chalta hai.")
     elif data == "u:activate":
-        await q.message.reply_text(
-            f"Apna key bhejo:\n`/activate ICH-ABCD-1234`\n\n{contact_block()}",
-            parse_mode=ParseMode.MARKDOWN)
+        await _reply(update,
+            f"Apna key bhejo:\n`/activate ICH-ABCD-1234`\n\n{contact_block()}")
     elif data == "u:status":
         await cmd_status(update, context)
     elif data == "u:credits":
@@ -1368,12 +1477,14 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ===========================================================================
 async def run() -> None:
     init_db()
+    load_channels()
+
     log.info("Owner: %s | Admins: %s", OWNER_ID, ADMIN_IDS)
-    log.info("Channels: %s", [c["username"] for c in REQUIRED_CHANNELS])
+    log.info("Channels (%d): %s", len(_REQUIRED_CHANNELS),
+             [c["username"] for c in _REQUIRED_CHANNELS])
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Conversation FIRST
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(gen_entry, pattern=r"^a:newcode$")],
         states={
@@ -1384,7 +1495,6 @@ async def run() -> None:
         fallbacks=[CommandHandler("cancel", gen_cancel)],
         per_chat=True, per_user=True))
 
-    # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("activate", cmd_activate))
@@ -1402,14 +1512,12 @@ async def run() -> None:
     app.add_handler(CommandHandler("logs", cmd_logs))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("debugchannels", cmd_debugchannels))
-    app.add_handler(CommandHandler("unverify", cmd_unverify))
+    app.add_handler(CommandHandler("addchannel", cmd_addchannel))
+    app.add_handler(CommandHandler("removechannel", cmd_removechannel))
+    app.add_handler(CommandHandler("channels", cmd_channels))
 
-    # Callbacks
     app.add_handler(CallbackQueryHandler(on_callback))
-
-    # Text (LAST)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_message))
-
     app.add_error_handler(on_error)
 
     await app.initialize()
