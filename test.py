@@ -1,5 +1,5 @@
 """
-Indian Cyber Hub - OSINT Bot (Final Fixed + DB Migration)
+Indian Cyber Hub - OSINT Bot (Final — Credits System Fixed)
 Run: python test.py
 """
 from __future__ import annotations
@@ -55,8 +55,6 @@ DEFAULT_CREDITS       = 0
 ADMIN_UNLIMITED       = True
 MAX_MSG_LEN           = 3800
 SHOW_RAW_API_RESPONSE = True
-
-USE_CREDITS_EVEN_WITH_KEY = False
 
 HIDDEN_API_KEYS = {"expiry_date", "days_left", "developer", "updates"}
 
@@ -163,14 +161,11 @@ def init_db() -> None:
 
 
 def _migrate_db() -> None:
-    """Auto-migrate old DBs — add missing columns safely."""
-    # --- required_channels migrations ---
     with _conn() as c:
         try:
             cols = {r["name"] for r in c.execute("PRAGMA table_info(required_channels)").fetchall()}
         except Exception:
             cols = set()
-
         for col_name, sql in [
             ("added_at", "ALTER TABLE required_channels ADD COLUMN added_at TEXT"),
             ("added_by", "ALTER TABLE required_channels ADD COLUMN added_by INTEGER"),
@@ -178,25 +173,22 @@ def _migrate_db() -> None:
             if col_name not in cols:
                 try:
                     c.execute(sql)
-                    log.info("🔧 Migrated: added '%s' column to required_channels", col_name)
+                    log.info("🔧 Migrated: added '%s' to required_channels", col_name)
                 except sqlite3.OperationalError as e:
-                    log.warning("Migration failed for %s: %s", col_name, e)
+                    log.warning("Migration failed: %s", e)
 
-    # --- users migrations ---
     with _conn() as c:
         try:
             cols = {r["name"] for r in c.execute("PRAGMA table_info(users)").fetchall()}
         except Exception:
             cols = set()
-
         if "credits" not in cols:
             try:
                 c.execute("ALTER TABLE users ADD COLUMN credits INTEGER NOT NULL DEFAULT 0")
-                log.info("🔧 Migrated: added 'credits' column to users")
+                log.info("🔧 Migrated: added 'credits' to users")
             except sqlite3.OperationalError as e:
                 log.warning("users migration failed: %s", e)
 
-    # --- settings table (ensure exists) ---
     with _conn() as c:
         try:
             c.execute("""
@@ -207,20 +199,6 @@ def _migrate_db() -> None:
             """)
         except Exception as e:
             log.warning("settings create failed: %s", e)
-
-    # --- user_codes migrations ---
-    with _conn() as c:
-        try:
-            cols = {r["name"] for r in c.execute("PRAGMA table_info(user_codes)").fetchall()}
-        except Exception:
-            cols = set()
-
-        if "expires_at" not in cols and cols:
-            try:
-                c.execute("ALTER TABLE user_codes ADD COLUMN expires_at TEXT")
-                log.info("🔧 Migrated: added 'expires_at' column to user_codes")
-            except sqlite3.OperationalError as e:
-                log.warning("user_codes migration failed: %s", e)
 
 
 # ---------------- Settings ----------------
@@ -274,11 +252,6 @@ def db_list_channels() -> list:
 
 
 def load_channels() -> None:
-    """
-    ⭐ CRITICAL FIX:
-    Channels are seeded ONLY ONCE (first ever run).
-    After that, whatever is in DB stays — no auto re-seed.
-    """
     global _REQUIRED_CHANNELS
 
     if FORCE_CLEAN_CHANNELS:
@@ -470,7 +443,7 @@ def user_active_key_info(user_id: int) -> Optional[dict]:
     now = _now()
     with _conn() as c:
         rows = c.execute("""
-            SELECT ac.code, ac.expires_at, ac.active, ac.uses, ac.max_uses
+            SELECT ac.code, ac.expires_at, ac.active, ac.uses, ac.max_uses, ac.credits
             FROM user_codes uc JOIN access_codes ac ON ac.code = uc.code
             WHERE uc.user_id = ? ORDER BY uc.activated_at DESC
         """, (user_id,)).fetchall()
@@ -484,7 +457,11 @@ def user_active_key_info(user_id: int) -> Optional[dict]:
         if exp.tzinfo is None:
             exp = exp.replace(tzinfo=timezone.utc)
         if exp > now:
-            return {"code": r["code"], "expires_at": exp}
+            return {
+                "code": r["code"],
+                "expires_at": exp,
+                "key_credits": int(r["credits"] or 0),
+            }
     return None
 
 
@@ -710,7 +687,8 @@ def touch_user(update: Update) -> None:
 def check_access(user_id: int):
     if is_admin(user_id) and ADMIN_UNLIMITED:
         return True, "admin"
-    if user_active_key_info(user_id) is not None:
+    key_info = user_active_key_info(user_id)
+    if key_info is not None:
         return True, "key"
     if get_credits(user_id) > 0:
         return True, "credits"
@@ -855,7 +833,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     credits = get_credits(uid)
     allowed, reason = check_access(uid)
-    has_key = user_active_key_info(uid) is not None
+    key_info = user_active_key_info(uid)
     admin_flag = "🛡 *You are an ADMIN.*\n\n" if is_admin(uid) else ""
 
     if not allowed and not is_admin(uid):
@@ -865,10 +843,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=main_menu(is_admin(uid)))
         return
 
+    # Mode line
     if is_admin(uid):
         mode_line = f"🛡 Admin Unlimited  |  💎 Credits: *{credits}*"
-    elif has_key:
-        mode_line = f"♾ Unlimited (key)  |  💎 Credits: *{credits}*"
+    elif key_info:
+        if key_info["key_credits"] == 0:
+            mode_line = f"♾ Unlimited (key)  |  💎 Credits: *{credits}*"
+        else:
+            mode_line = f"🔑 Key active  |  💎 Credits: *{credits}* (1 per lookup)"
     else:
         mode_line = f"💎 Credits: *{credits}* (1 credit = 1 lookup)"
 
@@ -925,13 +907,24 @@ async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     exp_str = info["expires_at"].strftime("%Y-%m-%d %H:%M UTC")
+    bal = info["balance"]
+    credits_added = info["credits_added"]
+
+    # ⭐ Mode detection
+    if credits_added == 0:
+        mode_line = "♾ *Unlimited lookups* (jab tak key valid hai)"
+        footer_line = "Ab aap bejhijhak `/lookup NUMBER` kar sakte ho — unlimited!"
+    else:
+        mode_line = f"💎 *{credits_added} lookups* mil gaye"
+        footer_line = f"Ab aapke paas *{bal}* lookups hain. Har lookup 1 credit katega."
+
     await _reply(update,
         "✅ *Access Activated*\n\n"
         f"🔑 Key: `{info['code']}`\n"
-        f"♾ Mode: *Unlimited lookups*\n"
         f"⏳ Valid until: `{exp_str}`\n"
-        f"💎 Credits: `{info['balance']}`\n\n"
-        "Ab aap **unlimited** `/lookup NUMBER` kar sakte ho.",
+        f"📈 Mode: {mode_line}\n"
+        f"💎 Balance: `{bal}`\n\n"
+        f"{footer_line}",
         reply_markup=main_menu(is_admin(update.effective_user.id)))
 
 
@@ -940,13 +933,17 @@ async def cmd_credits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     touch_user(update)
     uid = update.effective_user.id
     bal = get_credits(uid)
-    has_key = user_active_key_info(uid) is not None
+    key_info = user_active_key_info(uid)
 
     if is_admin(uid) and ADMIN_UNLIMITED:
         text = f"💎 Credits: *{bal}*\n🛡 Admin: *Unlimited (credits not used)*"
-    elif has_key:
+    elif key_info and key_info["key_credits"] == 0:
         text = (f"💎 Credits: *{bal}*\n"
                 "♾ *Unlimited mode* — key active hai, credits use nahi ho rahe")
+    elif key_info and key_info["key_credits"] > 0:
+        text = (f"💎 Credits: *{bal}*\n"
+                f"🔑 Key: `{key_info['code']}`\n"
+                "📌 Har lookup 1 credit katega.")
     else:
         text = (f"💎 Credits: *{bal}*\n\n"
                 "📌 *1 lookup = 1 credit*\n"
@@ -968,8 +965,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if is_admin(uid) and ADMIN_UNLIMITED:
         mode_line = "🛡 Admin Unlimited"
-    elif info:
+    elif info and info.get("key_credits", 0) == 0:
         mode_line = "♾ Unlimited (key)"
+    elif info and info.get("key_credits", 0) > 0:
+        mode_line = f"🔑 Key ({info['key_credits']} credits/key)"
     elif bal > 0:
         mode_line = f"💎 Credit-based ({bal} left)"
     else:
@@ -1036,12 +1035,16 @@ async def do_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, number: 
                                        parse_mode=ParseMode.MARKDOWN)
         return
 
+    # ⭐ Mode detection:
+    # Admin → unlimited
+    # Key with credits=0 → unlimited
+    # Key with credits>0 → credit mode (deduct 1)
+    # No key, only credits → credit mode
     is_admin_user = is_admin(uid) and ADMIN_UNLIMITED
-    has_active_key = user_active_key_info(uid) is not None
+    key_info = user_active_key_info(uid)
+    key_is_unlimited = key_info is not None and key_info.get("key_credits", 0) == 0
 
-    if is_admin_user:
-        unlimited_mode = True
-    elif has_active_key and not USE_CREDITS_EVEN_WITH_KEY:
+    if is_admin_user or key_is_unlimited:
         unlimited_mode = True
     else:
         unlimited_mode = False
@@ -1395,7 +1398,10 @@ async def cmd_newcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if len(args) >= 3: credits = int(args[2])
     except ValueError:
         await _reply(update,
-            "Usage: `/newcode [hours] [uses] [credits]`\nExample: `/newcode 24 5 10`")
+            "Usage: `/newcode [hours] [uses] [credits]`\n\n"
+            "Examples:\n"
+            "`/newcode 720 1 0` – 30 din, 1 user, unlimited\n"
+            "`/newcode 720 5 100` – 30 din, 5 users, 100 credits each")
         return
     if not (1 <= hours <= 24 * 365 * 100):
         await _reply(update, "Hours: 1–876000"); return
@@ -1407,14 +1413,21 @@ async def cmd_newcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     code = create_code(hours=hours, max_uses=uses,
                        credits_per_use=credits,
                        created_by=update.effective_user.id)
+
+    if credits == 0:
+        mode_line = "♾ *Unlimited lookups* (key valid tak)"
+    else:
+        mode_line = f"💎 *{credits} lookups* per user"
+
     await _reply(update,
         "✅ *Access Key Generated*\n\n"
-        f"🔑 Key:\n`{code}`\n\n"
+        f"🔑 *Key (copy this):*\n"
+        f"`/activate {code}`\n\n"
         f"⏳ Validity: `{hours} hours`\n"
-        f"👥 Max Uses: `{uses}`\n"
-        f"💎 Credits: `{credits}`\n"
-        f"📊 Uses: `0/{uses}`\n\n"
-        "ℹ️ Activate karne par user ko *unlimited* lookups milenge.")
+        f"👥 Max Uses: `{uses}` user(s)\n"
+        f"📊 Uses: `0/{uses}`\n"
+        f"📈 Mode: {mode_line}\n\n"
+        "ℹ️ Upar wali line user ko bhejo — wo direct `/activate` kar lega.")
 
 
 @admin_only
@@ -1450,8 +1463,9 @@ async def cmd_codes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["📋 *Recent Access Keys*", ""]
     for r in rows:
         icon = "✅" if (r["active"] and _code_is_valid(r)) else "❌"
+        mode = "♾" if r["credits"] == 0 else f"💎{r['credits']}"
         lines.append(f"`{r['code']}` – {r['uses']}/{r['max_uses']} – "
-                     f"exp {r['expires_at'][:16]} – {icon}")
+                     f"{mode} – exp {r['expires_at'][:16]} – {icon}")
     await _reply(update, "\n".join(lines))
 
 
@@ -1537,7 +1551,9 @@ async def gen_uses(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return GEN_USES
     context.user_data["gen"]["uses"] = int(txt)
     await update.message.reply_text(
-        "💎 *Step 3/3* — Credits per activation (unlimited ke liye `0`)\nExample: `0`",
+        "💎 *Step 3/3* — Credits per activation\n"
+        "• `0` = Unlimited lookups (key valid tak)\n"
+        "• `100` = 100 lookups per user\n\nExample: `0`",
         parse_mode=ParseMode.MARKDOWN)
     return GEN_CREDITS
 
@@ -1553,14 +1569,21 @@ async def gen_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hours, uses, credits = g.get("hours", 24), g.get("uses", 5), int(txt)
     code = create_code(hours=hours, max_uses=uses, credits_per_use=credits,
                        created_by=update.effective_user.id)
+
+    if credits == 0:
+        mode_line = "♾ *Unlimited lookups* (key valid tak)"
+    else:
+        mode_line = f"💎 *{credits} lookups* per user"
+
     await update.message.reply_text(
         "✅ *Access Key Generated*\n\n"
-        f"🔑 Key:\n`{code}`\n\n"
+        f"🔑 *Key (copy this):*\n"
+        f"`/activate {code}`\n\n"
         f"⏳ Validity: `{hours} hours`\n"
-        f"👥 Max Uses: `{uses}`\n"
-        f"💎 Credits: `{credits}`\n"
-        f"📊 Uses: `0/{uses}`\n\n"
-        "ℹ️ Activate karne par user ko *unlimited* lookups milenge.",
+        f"👥 Max Uses: `{uses}` user(s)\n"
+        f"📊 Uses: `0/{uses}`\n"
+        f"📈 Mode: {mode_line}\n\n"
+        "ℹ️ Upar wali line user ko bhejo — wo direct `/activate` kar lega.",
         parse_mode=ParseMode.MARKDOWN)
     return ConversationHandler.END
 
@@ -1721,7 +1744,6 @@ async def run() -> None:
     log.info("Owner: %s | Admins: %s", OWNER_ID, ADMIN_IDS)
     log.info("Channels (%d): %s", len(_REQUIRED_CHANNELS),
              [c["username"] for c in _REQUIRED_CHANNELS])
-    log.info("USE_CREDITS_EVEN_WITH_KEY: %s", USE_CREDITS_EVEN_WITH_KEY)
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
