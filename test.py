@@ -1,5 +1,5 @@
 """
-Indian Cyber Hub - OSINT Bot (All Fixed + Auto-Cleanup)
+Indian Cyber Hub - OSINT Bot (Final Fixed + DB Migration)
 Run: python test.py
 """
 from __future__ import annotations
@@ -56,15 +56,14 @@ ADMIN_UNLIMITED       = True
 MAX_MSG_LEN           = 3800
 SHOW_RAW_API_RESPONSE = True
 
+USE_CREDITS_EVEN_WITH_KEY = False
+
 HIDDEN_API_KEYS = {"expiry_date", "days_left", "developer", "updates"}
 
-# ✅ Sirf 1 channel — ye DB me seed hoga
 DEFAULT_CHANNELS = [
     {"username": "@indiancyberhub24", "name": "Indian Cyber Hub", "url": "https://t.me/indiancyberhub24"},
 ]
 
-# ⚠️ Force reset — pehli baar chalne par purane channels delete kar dega
-# True rakho pehli baar, phir False kar sakte ho
 FORCE_CLEAN_CHANNELS = False
 
 _REQUIRED_CHANNELS: list[dict] = []
@@ -84,7 +83,7 @@ log = logging.getLogger("osint-bot")
 # ===========================================================================
 # DATABASE
 # ===========================================================================
-_DB_LOCK = threading.Lock()
+_DB_LOCK = threading.RLock()
 
 
 def _now() -> datetime:
@@ -98,7 +97,7 @@ def _iso(dt: datetime) -> str:
 @contextmanager
 def _conn():
     with _DB_LOCK:
-        conn = sqlite3.connect(DB_PATH, timeout=15, isolation_level="IMMEDIATE")
+        conn = sqlite3.connect(DB_PATH, timeout=20, isolation_level="IMMEDIATE")
         conn.row_factory = sqlite3.Row
         try:
             yield conn
@@ -154,9 +153,92 @@ def init_db() -> None:
                 added_at TEXT NOT NULL,
                 added_by INTEGER
             );
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
         """)
 
+    _migrate_db()
 
+
+def _migrate_db() -> None:
+    """Auto-migrate old DBs — add missing columns safely."""
+    # --- required_channels migrations ---
+    with _conn() as c:
+        try:
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(required_channels)").fetchall()}
+        except Exception:
+            cols = set()
+
+        for col_name, sql in [
+            ("added_at", "ALTER TABLE required_channels ADD COLUMN added_at TEXT"),
+            ("added_by", "ALTER TABLE required_channels ADD COLUMN added_by INTEGER"),
+        ]:
+            if col_name not in cols:
+                try:
+                    c.execute(sql)
+                    log.info("🔧 Migrated: added '%s' column to required_channels", col_name)
+                except sqlite3.OperationalError as e:
+                    log.warning("Migration failed for %s: %s", col_name, e)
+
+    # --- users migrations ---
+    with _conn() as c:
+        try:
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(users)").fetchall()}
+        except Exception:
+            cols = set()
+
+        if "credits" not in cols:
+            try:
+                c.execute("ALTER TABLE users ADD COLUMN credits INTEGER NOT NULL DEFAULT 0")
+                log.info("🔧 Migrated: added 'credits' column to users")
+            except sqlite3.OperationalError as e:
+                log.warning("users migration failed: %s", e)
+
+    # --- settings table (ensure exists) ---
+    with _conn() as c:
+        try:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+        except Exception as e:
+            log.warning("settings create failed: %s", e)
+
+    # --- user_codes migrations ---
+    with _conn() as c:
+        try:
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(user_codes)").fetchall()}
+        except Exception:
+            cols = set()
+
+        if "expires_at" not in cols and cols:
+            try:
+                c.execute("ALTER TABLE user_codes ADD COLUMN expires_at TEXT")
+                log.info("🔧 Migrated: added 'expires_at' column to user_codes")
+            except sqlite3.OperationalError as e:
+                log.warning("user_codes migration failed: %s", e)
+
+
+# ---------------- Settings ----------------
+def get_setting(key: str, default: str = "") -> str:
+    with _conn() as c:
+        row = c.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with _conn() as c:
+        c.execute("""
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """, (key, value))
+
+
+# ---------------- Channels ----------------
 def db_add_channel(username: str, name: str, url: str, added_by: Optional[int] = None) -> bool:
     try:
         with _conn() as c:
@@ -167,6 +249,9 @@ def db_add_channel(username: str, name: str, url: str, added_by: Optional[int] =
         return True
     except sqlite3.IntegrityError:
         return False
+    except sqlite3.OperationalError as e:
+        log.error("db_add_channel failed: %s", e)
+        return False
 
 
 def db_remove_channel(username: str) -> bool:
@@ -176,7 +261,6 @@ def db_remove_channel(username: str) -> bool:
 
 
 def db_clear_channels() -> int:
-    """Delete ALL channels from DB. Returns count deleted."""
     with _conn() as c:
         cur = c.execute("DELETE FROM required_channels")
         return cur.rowcount
@@ -190,26 +274,31 @@ def db_list_channels() -> list:
 
 
 def load_channels() -> None:
-    """Load channels from DB. Auto-cleanup if FORCE_CLEAN_CHANNELS = True."""
+    """
+    ⭐ CRITICAL FIX:
+    Channels are seeded ONLY ONCE (first ever run).
+    After that, whatever is in DB stays — no auto re-seed.
+    """
     global _REQUIRED_CHANNELS
 
-    # ⭐ Auto-cleanup: sirf DEFAULT_CHANNELS wale rakho
     if FORCE_CLEAN_CHANNELS:
         default_usernames = {ch["username"] for ch in DEFAULT_CHANNELS}
-        rows = db_list_channels()
-        for r in rows:
+        for r in db_list_channels():
             if r["username"] not in default_usernames:
-                log.info("🧹 Removing old channel from DB: %s", r["username"])
+                log.info("🧹 FORCE_CLEAN: removing %s", r["username"])
                 db_remove_channel(r["username"])
 
-    rows = db_list_channels()
+    initialized = get_setting("channels_initialized", "") == "1"
 
-    # Seed defaults if empty
-    if not rows:
+    if not initialized:
         for ch in DEFAULT_CHANNELS:
             db_add_channel(ch["username"], ch["name"], ch["url"], None)
-        rows = db_list_channels()
+        set_setting("channels_initialized", "1")
+        log.info("🌱 First run: seeded %d default channel(s)", len(DEFAULT_CHANNELS))
+    else:
+        log.info("ℹ️ Channels already initialized — no auto-seed")
 
+    rows = db_list_channels()
     _REQUIRED_CHANNELS = [
         {"username": r["username"], "name": r["name"], "url": r["url"]}
         for r in rows
@@ -219,7 +308,7 @@ def load_channels() -> None:
              [c["username"] for c in _REQUIRED_CHANNELS])
 
 
-# ------------------- Users / Codes -------------------
+# ---------------- Users / Credits ----------------
 def upsert_user(user_id: int, username: str) -> None:
     now = _iso(_now())
     with _conn() as c:
@@ -246,7 +335,9 @@ def add_credits(user_id: int, amount: int) -> int:
             ON CONFLICT(user_id) DO UPDATE SET credits = MAX(0, credits + ?)
         """, (user_id, _iso(_now()), _iso(_now()), max(0, amount), amount))
         row = c.execute("SELECT credits FROM users WHERE user_id = ?", (user_id,)).fetchone()
-        return row["credits"] if row else 0
+        bal = row["credits"] if row else 0
+    log.info("💎 add_credits: user=%s amount=%+d new=%s", user_id, amount, bal)
+    return bal
 
 
 def deduct_credit(user_id: int) -> bool:
@@ -254,7 +345,15 @@ def deduct_credit(user_id: int) -> bool:
         cur = c.execute(
             "UPDATE users SET credits = credits - 1 WHERE user_id = ? AND credits > 0",
             (user_id,))
-        return cur.rowcount > 0
+        ok = cur.rowcount > 0
+        if ok:
+            new_bal = c.execute(
+                "SELECT credits FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()["credits"]
+            log.info("💎 deduct_credit: user=%s new=%s", user_id, new_bal)
+        else:
+            log.warning("💎 deduct_credit FAILED: user=%s no credits", user_id)
+        return ok
 
 
 def list_users(limit: int = 50) -> list:
@@ -264,6 +363,7 @@ def list_users(limit: int = 50) -> list:
             "ORDER BY last_seen DESC LIMIT ?", (limit,)).fetchall()
 
 
+# ---------------- Access Codes ----------------
 _ALPHABET = string.ascii_uppercase + string.digits
 
 
@@ -360,6 +460,8 @@ def activate_code(user_id: int, code: str):
             "SELECT credits FROM users WHERE user_id = ?", (user_id,)
         ).fetchone()["credits"]
 
+    log.info("🔑 Key %s activated by user %s (+%s credits, bal %s)",
+             code, user_id, credits_to_add, new_bal)
     return True, {"code": code, "credits_added": credits_to_add,
                   "balance": new_bal, "expires_at": exp}
 
@@ -386,6 +488,7 @@ def user_active_key_info(user_id: int) -> Optional[dict]:
     return None
 
 
+# ---------------- Rate Limit / Logs ----------------
 def rate_limit_ok(user_id: int, max_calls: int = 10, window_seconds: int = 60) -> bool:
     cutoff = _iso(_now() - timedelta(seconds=window_seconds))
     with _conn() as c:
@@ -543,20 +646,15 @@ def contact_block() -> str:
 
 def access_denied_text(reason: str = "no_key") -> str:
     if reason == "expired":
-        head = "🔐 Access Expired"
-        body = "Aapki access key expire ho gayi hai."
+        head, body = "🔐 Access Expired", "Aapki access key expire ho gayi hai."
     elif reason == "revoked":
-        head = "🔐 Access Revoked"
-        body = "Aapki access key revoke kar di gayi hai."
+        head, body = "🔐 Access Revoked", "Aapki access key revoke kar di gayi hai."
     elif reason == "exhausted":
-        head = "🔐 Access Exhausted"
-        body = "Aapki access key ki maximum uses khatam ho gayi."
+        head, body = "🔐 Access Exhausted", "Aapki access key ki maximum uses khatam ho gayi."
     elif reason == "no_credits":
-        head = "💎 Credits Khatam"
-        body = "Aapke credits khatam ho gaye."
+        head, body = "💎 Credits Khatam", "Aapke credits khatam ho gaye."
     else:
-        head = "🔐 Access Required"
-        body = "Is bot ko use karne ke liye valid access key required hai."
+        head, body = "🔐 Access Required", "Is bot ko use karne ke liye valid access key required hai."
 
     return (f"*{head}*\n\n{body}\n\n"
             "Key milne ke baad:\n`/activate YOUR-KEY`\n\n"
@@ -597,6 +695,8 @@ def channels_admin_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("➕ Add Channel/Group", callback_data="a:addch_hint")],
         [InlineKeyboardButton("➖ Remove Channel", callback_data="a:removech_hint")],
         [InlineKeyboardButton("📋 List Channels", callback_data="a:listchannels")],
+        [InlineKeyboardButton("🧹 Clear All", callback_data="a:clearch_hint")],
+        [InlineKeyboardButton("🌱 Add Defaults", callback_data="a:adddefaults")],
         [InlineKeyboardButton("⬅️ Back", callback_data="a:panel")],
     ])
 
@@ -657,7 +757,6 @@ async def check_missing_channels(context: ContextTypes.DEFAULT_TYPE,
         try:
             member = await context.bot.get_chat_member(
                 chat_id=ch["username"], user_id=user_id)
-
             status = getattr(member, "status", "")
             if hasattr(status, "value"):
                 status = status.value
@@ -669,11 +768,9 @@ async def check_missing_channels(context: ContextTypes.DEFAULT_TYPE,
                 continue
             if status == "restricted" and getattr(member, "is_member", False):
                 continue
-
             missing.append(ch["name"])
-
         except Exception as e:
-            log.warning("Channel check FAILED [%s] → marking missing. Err: %s",
+            log.warning("Channel check FAILED [%s] → marking missing: %s",
                         ch["username"], str(e)[:150])
             missing.append(ch["name"])
 
@@ -682,8 +779,6 @@ async def check_missing_channels(context: ContextTypes.DEFAULT_TYPE,
 
 async def _reply(update: Update, text: str,
                  reply_markup=None, prefer_edit: bool = False) -> None:
-    """Universal reply — works for messages AND callback queries.
-    Falls back to plain text if Markdown parsing fails."""
     try:
         cq = update.callback_query
         target = None
@@ -695,7 +790,7 @@ async def _reply(update: Update, text: str,
         elif update.message:
             target = update.message
         else:
-            log.warning("_reply: no target for update")
+            log.warning("_reply: no target")
             return
 
         if use_edit:
@@ -715,7 +810,7 @@ async def _reply(update: Update, text: str,
                 disable_web_page_preview=True)
             return
         except Exception as md_err:
-            log.warning("Markdown failed, sending plain text: %s", md_err)
+            log.warning("Markdown failed, sending plain: %s", md_err)
 
         try:
             await target.reply_text(text, reply_markup=reply_markup)
@@ -770,7 +865,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=main_menu(is_admin(uid)))
         return
 
-    mode_line = "♾ *Unlimited* (active key)" if has_key else f"💎 Credits: *{credits}*"
+    if is_admin(uid):
+        mode_line = f"🛡 Admin Unlimited  |  💎 Credits: *{credits}*"
+    elif has_key:
+        mode_line = f"♾ Unlimited (key)  |  💎 Credits: *{credits}*"
+    else:
+        mode_line = f"💎 Credits: *{credits}* (1 credit = 1 lookup)"
+
     text = ("👋 *Welcome to Indian Cyber Hub – Authorized OSINT Bot*\n\n"
             f"{admin_flag}"
             "📱 *Bas number bhejo — result milega.*\n\n"
@@ -800,7 +901,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_admin(uid):
         text += ("\n\n*Admin:*\n`/admin` `/newcode` `/addcredits` "
                  "`/revoke` `/codes` `/users` `/logs` `/stats`\n"
-                 "`/addchannel` `/removechannel` `/channels` `/debugchannels`")
+                 "`/addchannel` `/removechannel` `/channels` `/clearchannels`\n"
+                 "`/adddefaults` `/resetchannels` `/debugchannels`")
     await _reply(update, text, reply_markup=main_menu(is_admin(uid)))
 
 
@@ -827,7 +929,8 @@ async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "✅ *Access Activated*\n\n"
         f"🔑 Key: `{info['code']}`\n"
         f"♾ Mode: *Unlimited lookups*\n"
-        f"⏳ Valid until: `{exp_str}`\n\n"
+        f"⏳ Valid until: `{exp_str}`\n"
+        f"💎 Credits: `{info['balance']}`\n\n"
         "Ab aap **unlimited** `/lookup NUMBER` kar sakte ho.",
         reply_markup=main_menu(is_admin(update.effective_user.id)))
 
@@ -838,12 +941,16 @@ async def cmd_credits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     uid = update.effective_user.id
     bal = get_credits(uid)
     has_key = user_active_key_info(uid) is not None
+
     if is_admin(uid) and ADMIN_UNLIMITED:
-        text = f"💎 Credits: *{bal}*\n🛡 Admin: *Unlimited*"
+        text = f"💎 Credits: *{bal}*\n🛡 Admin: *Unlimited (credits not used)*"
     elif has_key:
-        text = f"💎 Credits: *{bal}*\n♾ *Unlimited* (active key ke saath)"
+        text = (f"💎 Credits: *{bal}*\n"
+                "♾ *Unlimited mode* — key active hai, credits use nahi ho rahe")
     else:
-        text = f"💎 Credits: *{bal}*\n\nEk lookup = 1 credit."
+        text = (f"💎 Credits: *{bal}*\n\n"
+                "📌 *1 lookup = 1 credit*\n"
+                "Har number bhejne par 1 credit katega.")
     await _reply(update, text, reply_markup=main_menu(is_admin(uid)))
 
 
@@ -853,17 +960,28 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     uid = update.effective_user.id
     info = user_active_key_info(uid)
     allowed, reason = check_access(uid)
+    bal = get_credits(uid)
+
     access_line = "🟢 Active" if allowed else "🔴 Inactive"
     key_line = f"`{info['code']}`" if info else "—"
     exp_line = info["expires_at"].strftime("%Y-%m-%d %H:%M UTC") if info else "—"
-    mode_line = "♾ Unlimited" if (info or (is_admin(uid) and ADMIN_UNLIMITED)) else "💎 Credit-based"
+
+    if is_admin(uid) and ADMIN_UNLIMITED:
+        mode_line = "🛡 Admin Unlimited"
+    elif info:
+        mode_line = "♾ Unlimited (key)"
+    elif bal > 0:
+        mode_line = f"💎 Credit-based ({bal} left)"
+    else:
+        mode_line = "🔴 No access"
+
     text = ("📊 *Your Status*\n\n"
             f"🆔 User ID: `{uid}`\n"
             f"🔐 Access: *{access_line}*\n"
             f"🎟 Active Key: {key_line}\n"
             f"⏳ Key Expiry: `{exp_line}`\n"
             f"📈 Mode: *{mode_line}*\n"
-            f"💎 Credits: `{get_credits(uid)}`\n"
+            f"💎 Credits: `{bal}`\n"
             f"🛡 Admin: `{'Yes' if is_admin(uid) else 'No'}`")
     if not allowed:
         text += f"\n\n_{reason}_"
@@ -883,12 +1001,10 @@ async def cmd_verify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     missing = await check_missing_channels(context, u.id)
     if missing:
-        text = (
-            "⚠️ *Verification Pending*\n\n"
-            "Abhi ye channel(s)/group(s) join karna baaki hai:\n\n"
-            + "\n".join(f"• {m}" for m in missing)
-            + "\n\n👇 Join karke *✅ Verify* dobara dabao."
-        )
+        text = ("⚠️ *Verification Pending*\n\n"
+                "Abhi ye channel(s)/group(s) join karna baaki hai:\n\n"
+                + "\n".join(f"• {m}" for m in missing)
+                + "\n\n👇 Join karke *✅ Verify* dobara dabao.")
         await _reply(update, text, reply_markup=channels_join_keyboard())
         return
 
@@ -920,15 +1036,24 @@ async def do_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, number: 
                                        parse_mode=ParseMode.MARKDOWN)
         return
 
-    unlimited_mode = (is_admin(uid) and ADMIN_UNLIMITED) or \
-                     (user_active_key_info(uid) is not None)
+    is_admin_user = is_admin(uid) and ADMIN_UNLIMITED
+    has_active_key = user_active_key_info(uid) is not None
 
+    if is_admin_user:
+        unlimited_mode = True
+    elif has_active_key and not USE_CREDITS_EVEN_WITH_KEY:
+        unlimited_mode = True
+    else:
+        unlimited_mode = False
+
+    credits_used = 0
     if not unlimited_mode:
         if not deduct_credit(uid):
             log_lookup(uid, uname, number, "no_credits")
             await context.bot.send_message(chat.id, access_denied_text("no_credits"),
                                            parse_mode=ParseMode.MARKDOWN)
             return
+        credits_used = 1
 
     msg = await context.bot.send_message(chat.id, "🔎 Processing…")
 
@@ -936,7 +1061,7 @@ async def do_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, number: 
         result = await lookup_number(number)
     except LookupError as e:
         log_lookup(uid, uname, number, f"error:{e.kind}")
-        if not unlimited_mode:
+        if credits_used:
             add_credits(uid, 1)
         await msg.edit_text(f"⚠️ {e.user_message}\n\n_Credit refunded._",
                             parse_mode=ParseMode.MARKDOWN)
@@ -944,7 +1069,7 @@ async def do_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, number: 
     except Exception as e:
         log.exception("lookup failed: %s", e)
         log_lookup(uid, uname, number, "error:unexpected")
-        if not unlimited_mode:
+        if credits_used:
             add_credits(uid, 1)
         await msg.edit_text("⚠️ Unexpected error.\n\n_Credit refunded._",
                             parse_mode=ParseMode.MARKDOWN)
@@ -952,7 +1077,7 @@ async def do_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, number: 
 
     if result in (None, {}, []):
         log_lookup(uid, uname, number, "empty")
-        if not unlimited_mode:
+        if credits_used:
             add_credits(uid, 1)
         await msg.edit_text(
             f"ℹ️ Number `{number}` ka koi data nahi mila.\n\n_Credit refunded._",
@@ -962,8 +1087,18 @@ async def do_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, number: 
     log_lookup(uid, uname, number, "ok")
     body = format_result(result)
     header = f"✅ *Result for* `{number}`\n\n"
-    footer = "\n\n♾ *Unlimited access*" if unlimited_mode \
-             else f"\n\n💎 Credits left: `{get_credits(uid)}`"
+    bal = get_credits(uid)
+
+    if unlimited_mode:
+        if is_admin_user:
+            footer = f"\n\n🛡 *Admin mode*  •  💎 Credits: `{bal}` _(not used)_"
+        else:
+            footer = f"\n\n♾ *Unlimited*  •  💎 Credits: `{bal}` _(key active)_"
+    else:
+        if credits_used:
+            footer = f"\n\n💎 *1 credit used*  •  Credits left: `{bal}`"
+        else:
+            footer = f"\n\n💎 Credits: `{bal}`"
 
     full = header + "```\n" + body + "\n```" + footer
 
@@ -1079,7 +1214,9 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "`/addchannel @username Display Name`\n"
             "`/removechannel @username`\n"
             "`/channels` – list required channels\n"
-            "`/codes` `/users` `/logs` `/stats` `/debugchannels`")
+            "`/clearchannels` – remove ALL channels\n"
+            "`/adddefaults` – add default channels\n"
+            "`/resetchannels` – full reset")
     if update.callback_query:
         await edit_admin_text(update, text, reply_markup=admin_menu())
     else:
@@ -1161,21 +1298,45 @@ async def cmd_removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     load_channels()
     await _reply(update,
         f"✅ Removed: `{username}`\n\n"
-        f"📊 Total required: `{len(_REQUIRED_CHANNELS)}`")
+        f"📊 Total required: `{len(_REQUIRED_CHANNELS)}`\n\n"
+        f"ℹ️ Ye restart ke baad wapas nahi aayega.")
 
 
 @admin_only
 async def cmd_clearchannels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Force remove ALL channels and reset to defaults."""
     n = db_clear_channels()
-    for ch in DEFAULT_CHANNELS:
-        db_add_channel(ch["username"], ch["name"], ch["url"], None)
+    set_setting("channels_initialized", "1")
     load_channels()
     await _reply(update,
-        f"🧹 *Channels Cleared*\n\n"
-        f"Removed: `{n}` old channels\n"
-        f"Reset to: `{len(_REQUIRED_CHANNELS)}` default channel(s)\n\n"
-        f"📢 Active: `{_REQUIRED_CHANNELS[0]['username'] if _REQUIRED_CHANNELS else 'None'}`")
+        f"🧹 *All Channels Cleared*\n\n"
+        f"Removed: `{n}` channel(s)\n"
+        f"Active now: `{len(_REQUIRED_CHANNELS)}`\n\n"
+        f"ℹ️ Restart ke baad bhi koi channel wapas nahi aayega.\n"
+        f"Add new: `/addchannel @username Name`")
+
+
+@admin_only
+async def cmd_adddefaults(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    added = 0
+    for ch in DEFAULT_CHANNELS:
+        if db_add_channel(ch["username"], ch["name"], ch["url"], None):
+            added += 1
+    load_channels()
+    await _reply(update,
+        f"🌱 *Defaults Added*\n\n"
+        f"Added: `{added}` new channel(s)\n"
+        f"Active total: `{len(_REQUIRED_CHANNELS)}`")
+
+
+@admin_only
+async def cmd_resetchannels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    n = db_clear_channels()
+    set_setting("channels_initialized", "0")
+    load_channels()
+    await _reply(update,
+        f"🔄 *Full Reset Done*\n\n"
+        f"Cleared: `{n}` channel(s)\n\n"
+        f"ℹ️ Ab bot restart karo — DEFAULT_CHANNELS se re-seed hoga.")
 
 
 @admin_only
@@ -1183,15 +1344,16 @@ async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not _REQUIRED_CHANNELS:
         await _reply(update,
             "📢 *No required channels.*\n\n"
-            "Add one: `/addchannel @username Display Name`")
+            "Add one: `/addchannel @username Display Name`\n"
+            "Or: `/adddefaults`")
         return
 
     lines = [f"📢 *Required Channels* ({len(_REQUIRED_CHANNELS)})", ""]
     for i, ch in enumerate(_REQUIRED_CHANNELS, 1):
         lines.append(f"{i}. {ch['name']}\n   `{ch['username']}`\n   {ch['url']}")
     lines.append("")
-    lines.append("➕ Add: `/addchannel @username Name`")
-    lines.append("➖ Remove: `/removechannel @username`")
+    lines.append("➕ `/addchannel @username Name`")
+    lines.append("➖ `/removechannel @username`")
     await _reply(update, "\n".join(lines))
 
 
@@ -1219,7 +1381,7 @@ async def cmd_debugchannels(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         except Exception as e:
             lines.append(f"❌ `{ch['username']}` — ERROR: {str(e)[:70]}")
     lines.append("")
-    lines.append("ℹ️ ✅=OK, ⚠️=bot ko admin banao, ❌=username galat / bot add nahi hai")
+    lines.append("ℹ️ ✅=OK, ⚠️=bot ko admin banao, ❌=error")
     await _reply(update, "\n".join(lines))
 
 
@@ -1269,7 +1431,7 @@ async def cmd_addcredits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _reply(update, "Amount 0 nahi."); return
     new_bal = add_credits(target, amount)
     await _reply(update,
-        f"✅ `{target}` ko `{amount:+d}` credits.\n💎 Balance: `{new_bal}`")
+        f"✅ `{target}` ko `{amount:+d}` credits.\n💎 New balance: `{new_bal}`")
 
 
 @admin_only
@@ -1361,7 +1523,7 @@ async def gen_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return GEN_HOURS
     context.user_data["gen"]["hours"] = int(txt)
     await update.message.reply_text(
-        "👥 *Step 2/3* — Max uses (kitne users activate kar sakte hain)\nExample: `1`",
+        "👥 *Step 2/3* — Max uses\nExample: `1`",
         parse_mode=ParseMode.MARKDOWN)
     return GEN_USES
 
@@ -1427,13 +1589,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         pass
 
     try:
-        # ---------- VERIFY BUTTON ----------
         if data == "u:verify":
             touch_user(update)
             await cmd_verify(update, context)
             return
 
-        # ---------- ADMIN CALLBACKS ----------
         if data.startswith("a:"):
             if not is_admin(uid):
                 try:
@@ -1445,60 +1605,57 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
             if data == "a:panel":
                 await cmd_admin(update, context)
-
             elif data == "a:codes":
                 await cmd_codes(update, context)
-
             elif data == "a:revoke":
-                await _reply(update,
-                    "🚫 *Revoke Key*\n\nUse: `/revoke ICH-XXXX-XXXX`")
-
+                await _reply(update, "🚫 *Revoke Key*\n\nUse: `/revoke ICH-XXXX-XXXX`")
             elif data == "a:users":
                 await cmd_users(update, context)
-
             elif data == "a:addcredits":
                 await _reply(update,
                     "💎 *Add Credits*\n\nUse: `/addcredits USER_ID AMOUNT`\n"
                     "Example: `/addcredits 8250721152 10`")
-
             elif data == "a:logs":
                 await cmd_logs(update, context)
-
             elif data == "a:stats":
                 await cmd_stats(update, context)
-
             elif data == "a:debug":
                 await cmd_debugchannels(update, context)
 
             elif data == "a:channels_menu":
                 text = ("📢 *Manage Required Channels*\n\n"
                         f"Currently active: `{len(_REQUIRED_CHANNELS)}`\n\n"
-                        "➕ Add channel/group\n"
-                        "➖ Remove channel/group\n"
-                        "📋 View full list")
+                        "➕ Add · ➖ Remove · 📋 List · 🧹 Clear · 🌱 Defaults")
                 await edit_admin_text(update, text, reply_markup=channels_admin_menu())
 
             elif data == "a:addch_hint":
                 await _reply(update,
                     "➕ *Add Channel/Group*\n\n"
-                    "Use command:\n"
-                    "`/addchannel @username Display Name`\n\n"
+                    "Use: `/addchannel @username Display Name`\n\n"
                     "*Examples:*\n"
                     "`/addchannel @mychannel My Channel`\n"
                     "`/addchannel @mychannel My Channel https://t.me/mychannel`\n"
                     "`/addchannel -1001234567890 Private Group https://t.me/+abc123`\n\n"
-                    "⚠️ Bot ko us channel/group me *admin* banana zaroori hai.")
+                    "⚠️ Bot ko *admin* banana zaroori hai us channel/group me.")
 
             elif data == "a:removech_hint":
                 await _reply(update,
                     "➖ *Remove Channel*\n\n"
-                    "Use command:\n"
-                    "`/removechannel @username`\n\n"
+                    "Use: `/removechannel @username`\n"
                     "Example: `/removechannel @mychannel`\n\n"
                     "📋 Full list: `/channels`")
 
             elif data == "a:listchannels":
                 await cmd_channels(update, context)
+
+            elif data == "a:clearch_hint":
+                await _reply(update,
+                    "🧹 *Clear All Channels*\n\n"
+                    "Use: `/clearchannels`\n\n"
+                    "⚠️ Ye saare channels delete kar dega. Restart ke baad bhi wapas nahi aayenge.")
+
+            elif data == "a:adddefaults":
+                await cmd_adddefaults(update, context)
 
             elif data == "a:back":
                 text = "🏠 *Main Menu*\n\nNumber bhejo ya menu use karo 👇"
@@ -1507,14 +1664,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                         text, parse_mode=ParseMode.MARKDOWN,
                         reply_markup=main_menu(is_admin(uid)))
                 except Exception:
-                    await _reply(update, text,
-                                 reply_markup=main_menu(is_admin(uid)))
-
+                    await _reply(update, text, reply_markup=main_menu(is_admin(uid)))
             else:
                 log.warning("Unknown admin callback: %s", data)
             return
 
-        # ---------- USER CALLBACKS ----------
         touch_user(update)
 
         if not is_admin(uid):
@@ -1529,36 +1683,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "1️⃣ Pehle access key activate karo:\n`/activate ICH-XXXX-XXXX`\n\n"
                 "2️⃣ Phir number bhejo:\n`9876543210`\n`+919876543210`\n\n"
                 "Ya `/lookup 9876543210` bhi chalta hai.")
-
         elif data == "u:activate":
             await _reply(update,
                 f"Apna key bhejo:\n`/activate ICH-ABCD-1234`\n\n{contact_block()}")
-
         elif data == "u:status":
             await cmd_status(update, context)
-
         elif data == "u:credits":
             await cmd_credits(update, context)
-
         elif data == "u:help":
             await cmd_help(update, context)
-
         else:
             log.warning("Unknown user callback: %s", data)
 
     except Exception as e:
-        log.exception("on_callback FATAL error for data=%s: %s", data, e)
+        log.exception("on_callback FATAL data=%s: %s", data, e)
         try:
             if q.message:
-                await q.message.reply_text(
-                    f"⚠️ *Error:* `{str(e)[:200]}`",
-                    parse_mode=ParseMode.MARKDOWN)
+                await q.message.reply_text(f"⚠️ Error: {str(e)[:200]}")
         except Exception:
-            try:
-                if q.message:
-                    await q.message.reply_text(f"⚠️ Error: {str(e)[:200]}")
-            except Exception:
-                pass
+            pass
 
 
 # ===========================================================================
@@ -1578,6 +1721,7 @@ async def run() -> None:
     log.info("Owner: %s | Admins: %s", OWNER_ID, ADMIN_IDS)
     log.info("Channels (%d): %s", len(_REQUIRED_CHANNELS),
              [c["username"] for c in _REQUIRED_CHANNELS])
+    log.info("USE_CREDITS_EVEN_WITH_KEY: %s", USE_CREDITS_EVEN_WITH_KEY)
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -1611,7 +1755,9 @@ async def run() -> None:
     app.add_handler(CommandHandler("addchannel", cmd_addchannel))
     app.add_handler(CommandHandler("removechannel", cmd_removechannel))
     app.add_handler(CommandHandler("channels", cmd_channels))
-    app.add_handler(CommandHandler("clearchannels", cmd_clearchannels))  # ⭐ NEW
+    app.add_handler(CommandHandler("clearchannels", cmd_clearchannels))
+    app.add_handler(CommandHandler("adddefaults", cmd_adddefaults))
+    app.add_handler(CommandHandler("resetchannels", cmd_resetchannels))
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_message))
