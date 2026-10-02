@@ -1,5 +1,5 @@
 """
-Indian Cyber Hub - OSINT Bot (A_ToolsX Permanent Blocked)
+Indian Cyber Hub - OSINT Bot (Token Hardcoded - Env Var Ignored)
 Run: python test.py
 """
 from __future__ import annotations
@@ -33,12 +33,17 @@ from telegram.ext import (
 )
 
 # ===========================================================================
-# ⚙️ CONFIG
+# ⚙️ CONFIG — TOKEN HARDCODED (ENV VAR IGNORED)
 # ===========================================================================
-BOT_TOKEN            = os.getenv("BOT_TOKEN",            "8791206646:AAHI2xud5nXubIDqLTVEZvdZBlaVLQRZjB4").strip()
+# ⚠️ Ye token FIXED hai. Environment variable isse override nahi kar sakta.
+BOT_TOKEN = "8791206646:AAHI2xud5nXubIDqLTVEZvdZBlaVLQRZjB4"
+
+# Ye env var se aayenge (override optional)
 PUBLIC_OSINT_API_URL = os.getenv("PUBLIC_OSINT_API_URL", "https://osint.invalidayushh.workers.dev/numv2").strip()
 PUBLIC_OSINT_API_KEY = os.getenv("PUBLIC_OSINT_API_KEY", "Yogixysjisjsn").strip()
-DB_PATH              = os.getenv("DB_PATH",              "bot.db").strip() or "bot.db"
+
+# ⭐ DB path — fresh name so old bot.db conflicts na ho
+DB_PATH = "bot_v2.db"
 
 OWNER_ID = int(os.getenv("OWNER_ID", "8250721152"))
 ADMIN_IDS: set[int] = {OWNER_ID}
@@ -63,11 +68,10 @@ DEFAULT_CHANNELS = [
     {"username": "@indiancyberhub24", "name": "Indian Cyber Hub", "url": "https://t.me/indiancyberhub24"},
 ]
 
-# 🚫 PERMANENT BLACKLIST — ye channels kabhi nahi aayenge
+# 🚫 PERMANENT BLACKLIST
 BLOCKED_CHANNELS = {
-    "@A_ToolsX", "@a_toolsx", "@A_ToolsX".lower(),
-    "a_toolsx", "A_ToolsX",
-    "@AToolsX", "@atoolsx",
+    "@A_ToolsX", "@a_toolsx", "@AToolsX", "@atoolsx",
+    "a_toolsx", "A_ToolsX", "AToolsX",
 }
 
 _REQUIRED_CHANNELS: list[dict] = []
@@ -208,7 +212,6 @@ def _migrate_db() -> None:
             log.warning("settings create failed: %s", e)
 
 
-# ---------------- Settings ----------------
 def get_setting(key: str, default: str = "") -> str:
     with _conn() as c:
         row = c.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -225,7 +228,6 @@ def set_setting(key: str, value: str) -> None:
 
 # ---------------- Channels ----------------
 def _is_blocked(username: str) -> bool:
-    """Check if channel is in blacklist (case-insensitive)."""
     if not username:
         return False
     u = username.strip().lower()
@@ -241,7 +243,6 @@ def _is_blocked(username: str) -> bool:
 
 
 def db_add_channel(username: str, name: str, url: str, added_by: Optional[int] = None) -> bool:
-    # 🚫 Refuse to add blocked channels
     if _is_blocked(username):
         log.warning("🚫 Refused to add blocked channel: %s", username)
         return False
@@ -279,7 +280,6 @@ def db_list_channels() -> list:
 
 
 def purge_blocked_channels() -> int:
-    """Force-delete ALL blocked channels from DB. Returns count removed."""
     removed = 0
     for r in db_list_channels():
         if _is_blocked(r["username"]):
@@ -290,16 +290,13 @@ def purge_blocked_channels() -> int:
 
 
 def load_channels() -> None:
-    """Load channels — always purges blocked, seeds once, no re-seed."""
     global _REQUIRED_CHANNELS
 
-    # ⭐ STEP 1: ALWAYS purge blocked channels (every startup)
     n_blocked = purge_blocked_channels()
     if n_blocked:
         log.info("✅ Purged %d blocked channel(s)", n_blocked)
 
-    # ⭐ STEP 2: One-time cleanup — purani channels delete
-    cleanup_done = get_setting("channels_cleanup_v3", "") == "1"
+    cleanup_done = get_setting("channels_cleanup_v4", "") == "1"
     if not cleanup_done:
         default_usernames = {ch["username"] for ch in DEFAULT_CHANNELS}
         removed = 0
@@ -310,9 +307,8 @@ def load_channels() -> None:
                 removed += 1
         if removed:
             log.info("✅ Cleanup complete — removed %d old channel(s)", removed)
-        set_setting("channels_cleanup_v3", "1")
+        set_setting("channels_cleanup_v4", "1")
 
-    # ⭐ STEP 3: First-run seed
     initialized = get_setting("channels_initialized", "") == "1"
     if not initialized:
         for ch in DEFAULT_CHANNELS:
@@ -320,7 +316,6 @@ def load_channels() -> None:
         set_setting("channels_initialized", "1")
         log.info("🌱 First run: seeded %d default channel(s)", len(DEFAULT_CHANNELS))
 
-    # ⭐ STEP 4: Read from DB
     rows = db_list_channels()
     _REQUIRED_CHANNELS = [
         {"username": r["username"], "name": r["name"], "url": r["url"]}
@@ -940,7 +935,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text += ("\n\n*Admin:*\n`/admin` `/newcode` `/addcredits` "
                  "`/revoke` `/codes` `/users` `/logs` `/stats`\n"
                  "`/addchannel` `/removechannel` `/channels` `/clearchannels`\n"
-                 "`/adddefaults` `/resetchannels` `/debugchannels`")
+                 "`/adddefaults` `/resetchannels` `/debugchannels` `/purge`")
     await _reply(update, text, reply_markup=main_menu(is_admin(uid)))
 
 
@@ -1269,7 +1264,8 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "`/channels` – list required channels\n"
             "`/clearchannels` – remove ALL channels\n"
             "`/adddefaults` – add default channels\n"
-            "`/resetchannels` – full reset")
+            "`/resetchannels` – full reset\n"
+            "`/purge` – remove blocked channels")
     if update.callback_query:
         await edit_admin_text(update, text, reply_markup=admin_menu())
     else:
@@ -1305,7 +1301,6 @@ async def cmd_addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         username = "@" + raw_username
 
-    # 🚫 Block
     if _is_blocked(username):
         await _reply(update,
             f"🚫 *Channel Blocked*\n\n"
@@ -1392,7 +1387,7 @@ async def cmd_adddefaults(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def cmd_resetchannels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     n = db_clear_channels()
     set_setting("channels_initialized", "0")
-    set_setting("channels_cleanup_v3", "0")
+    set_setting("channels_cleanup_v4", "0")
     load_channels()
     await _reply(update,
         f"🔄 *Full Reset Done*\n\n"
@@ -1402,7 +1397,6 @@ async def cmd_resetchannels(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 @admin_only
 async def cmd_purge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Force remove blocked channels."""
     n = purge_blocked_channels()
     load_channels()
     await _reply(update,
@@ -1433,7 +1427,6 @@ async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_debugchannels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["🔧 *Channel Debug*", ""]
 
-    # Show blocked
     lines.append("*🚫 Blocked Channels:*")
     for b in sorted(BLOCKED_CHANNELS):
         lines.append(f"  • `{b}`")
@@ -1820,10 +1813,16 @@ async def run() -> None:
     init_db()
     load_channels()
 
+    # ⭐ Show which token is loaded (partial)
+    tok_preview = BOT_TOKEN[:15] + "..." + BOT_TOKEN[-5:] if BOT_TOKEN else "EMPTY"
+    log.info("=" * 60)
+    log.info("Bot Token: %s", tok_preview)
     log.info("Owner: %s | Admins: %s", OWNER_ID, ADMIN_IDS)
+    log.info("DB Path: %s", DB_PATH)
     log.info("Channels (%d): %s", len(_REQUIRED_CHANNELS),
              [c["username"] for c in _REQUIRED_CHANNELS])
     log.info("Blocked channels: %s", sorted(BLOCKED_CHANNELS))
+    log.info("=" * 60)
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
