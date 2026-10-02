@@ -1,5 +1,5 @@
 """
-Indian Cyber Hub - OSINT Bot (Token Hardcoded - Env Var Ignored)
+Indian Cyber Hub - OSINT Bot (Termux Ready — Token Hardcoded)
 Run: python test.py
 """
 from __future__ import annotations
@@ -33,19 +33,19 @@ from telegram.ext import (
 )
 
 # ===========================================================================
-# ⚙️ CONFIG — TOKEN HARDCODED (ENV VAR IGNORED)
+# ⚙️ CONFIG — TOKEN HARDCODED (ENV VAR IGNORED COMPLETELY)
 # ===========================================================================
-# ⚠️ Ye token FIXED hai. Environment variable isse override nahi kar sakta.
+# ⚠️⚠️⚠️ YE TOKEN FIXED HAI — ENV VAR ISSE OVERRIDE NAHI KAR SAKTA ⚠️⚠️⚠️
 BOT_TOKEN = "8791206646:AAHI2xud5nXubIDqLTVEZvdZBlaVLQRZjB4"
 
-# Ye env var se aayenge (override optional)
-PUBLIC_OSINT_API_URL = os.getenv("PUBLIC_OSINT_API_URL", "https://osint.invalidayushh.workers.dev/numv2").strip()
-PUBLIC_OSINT_API_KEY = os.getenv("PUBLIC_OSINT_API_KEY", "Yogixysjisjsn").strip()
+# API endpoints (env var optional — default me hardcoded)
+PUBLIC_OSINT_API_URL = "https://osint.invalidayushh.workers.dev/numv2"
+PUBLIC_OSINT_API_KEY = "Yogixysjisjsn"
 
-# ⭐ DB path — fresh name so old bot.db conflicts na ho
-DB_PATH = "bot_v2.db"
+# ⭐ Termux-friendly path (absolute)
+DB_PATH = os.path.expanduser("~/number1/bot.db")
 
-OWNER_ID = int(os.getenv("OWNER_ID", "8250721152"))
+OWNER_ID = 8250721152
 ADMIN_IDS: set[int] = {OWNER_ID}
 _env_admins = os.getenv("ADMIN_IDS", "").strip()
 if _env_admins:
@@ -63,12 +63,10 @@ SHOW_RAW_API_RESPONSE = True
 
 HIDDEN_API_KEYS = {"expiry_date", "days_left", "developer", "updates"}
 
-# ⭐ Only this channel
 DEFAULT_CHANNELS = [
     {"username": "@indiancyberhub24", "name": "Indian Cyber Hub", "url": "https://t.me/indiancyberhub24"},
 ]
 
-# 🚫 PERMANENT BLACKLIST
 BLOCKED_CHANNELS = {
     "@A_ToolsX", "@a_toolsx", "@AToolsX", "@atoolsx",
     "a_toolsx", "A_ToolsX", "AToolsX",
@@ -116,6 +114,12 @@ def _conn():
 
 
 def init_db() -> None:
+    # Ensure parent folder exists
+    try:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    except Exception:
+        pass
+
     with _conn() as c:
         c.executescript("""
             CREATE TABLE IF NOT EXISTS users (
@@ -184,9 +188,8 @@ def _migrate_db() -> None:
             if col_name not in cols:
                 try:
                     c.execute(sql)
-                    log.info("🔧 Migrated: added '%s' to required_channels", col_name)
-                except sqlite3.OperationalError as e:
-                    log.warning("Migration failed: %s", e)
+                except sqlite3.OperationalError:
+                    pass
 
     with _conn() as c:
         try:
@@ -196,9 +199,8 @@ def _migrate_db() -> None:
         if "credits" not in cols:
             try:
                 c.execute("ALTER TABLE users ADD COLUMN credits INTEGER NOT NULL DEFAULT 0")
-                log.info("🔧 Migrated: added 'credits' to users")
-            except sqlite3.OperationalError as e:
-                log.warning("users migration failed: %s", e)
+            except sqlite3.OperationalError:
+                pass
 
     with _conn() as c:
         try:
@@ -208,8 +210,8 @@ def _migrate_db() -> None:
                     value TEXT NOT NULL
                 )
             """)
-        except Exception as e:
-            log.warning("settings create failed: %s", e)
+        except Exception:
+            pass
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -296,7 +298,7 @@ def load_channels() -> None:
     if n_blocked:
         log.info("✅ Purged %d blocked channel(s)", n_blocked)
 
-    cleanup_done = get_setting("channels_cleanup_v4", "") == "1"
+    cleanup_done = get_setting("channels_cleanup_v5", "") == "1"
     if not cleanup_done:
         default_usernames = {ch["username"] for ch in DEFAULT_CHANNELS}
         removed = 0
@@ -307,7 +309,7 @@ def load_channels() -> None:
                 removed += 1
         if removed:
             log.info("✅ Cleanup complete — removed %d old channel(s)", removed)
-        set_setting("channels_cleanup_v4", "1")
+        set_setting("channels_cleanup_v5", "1")
 
     initialized = get_setting("channels_initialized", "") == "1"
     if not initialized:
@@ -511,7 +513,6 @@ def user_active_key_info(user_id: int) -> Optional[dict]:
     return None
 
 
-# ---------------- Rate Limit / Logs ----------------
 def rate_limit_ok(user_id: int, max_calls: int = 10, window_seconds: int = 60) -> bool:
     cutoff = _iso(_now() - timedelta(seconds=window_seconds))
     with _conn() as c:
@@ -585,8 +586,6 @@ def _do_request(number: str) -> Any:
     if PUBLIC_OSINT_API_KEY:
         params["key"] = PUBLIC_OSINT_API_KEY
 
-    log.info("API call: %s q=%s", PUBLIC_OSINT_API_URL, number)
-
     try:
         r = requests.get(
             PUBLIC_OSINT_API_URL, params=params, timeout=20,
@@ -599,7 +598,7 @@ def _do_request(number: str) -> Any:
     except requests.RequestException:
         raise LookupError("request", "API request failed.")
 
-    log.info("API status: %s | body: %s", r.status_code, r.text[:400])
+    log.info("API status: %s | body: %s", r.status_code, r.text[:300])
 
     if r.status_code == 401:
         raise LookupError("auth", "API key invalid (401).")
@@ -792,8 +791,6 @@ async def check_missing_channels(context: ContextTypes.DEFAULT_TYPE,
                 status = status.value
             status = str(status).lower().strip()
 
-            log.info("Channel %s → user %s = %s", ch["username"], user_id, status)
-
             if status in ("creator", "administrator", "member"):
                 continue
             if status == "restricted" and getattr(member, "is_member", False):
@@ -820,7 +817,6 @@ async def _reply(update: Update, text: str,
         elif update.message:
             target = update.message
         else:
-            log.warning("_reply: no target")
             return
 
         if use_edit:
@@ -830,8 +826,8 @@ async def _reply(update: Update, text: str,
                     reply_markup=reply_markup,
                     disable_web_page_preview=True)
                 return
-            except Exception as e:
-                log.debug("edit_text failed, will reply: %s", e)
+            except Exception:
+                pass
 
         try:
             await target.reply_text(
@@ -840,12 +836,12 @@ async def _reply(update: Update, text: str,
                 disable_web_page_preview=True)
             return
         except Exception as md_err:
-            log.warning("Markdown failed, sending plain: %s", md_err)
+            log.warning("Markdown failed: %s", md_err)
 
         try:
             await target.reply_text(text, reply_markup=reply_markup)
         except Exception as e:
-            log.exception("Plain reply also failed: %s", e)
+            log.exception("Plain reply failed: %s", e)
 
     except Exception as e:
         log.exception("_reply failed: %s", e)
@@ -1265,7 +1261,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "`/clearchannels` – remove ALL channels\n"
             "`/adddefaults` – add default channels\n"
             "`/resetchannels` – full reset\n"
-            "`/purge` – remove blocked channels")
+            "`/purge` – purge blocked channels")
     if update.callback_query:
         await edit_admin_text(update, text, reply_markup=admin_menu())
     else:
@@ -1387,7 +1383,7 @@ async def cmd_adddefaults(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def cmd_resetchannels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     n = db_clear_channels()
     set_setting("channels_initialized", "0")
-    set_setting("channels_cleanup_v4", "0")
+    set_setting("channels_cleanup_v5", "0")
     load_channels()
     await _reply(update,
         f"🔄 *Full Reset Done*\n\n"
@@ -1676,7 +1672,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     data = q.data or ""
     uid = update.effective_user.id if update.effective_user else 0
-    log.info("callback: %s from %s", data, uid)
 
     try:
         await q.answer()
@@ -1760,8 +1755,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                         reply_markup=main_menu(is_admin(uid)))
                 except Exception:
                     await _reply(update, text, reply_markup=main_menu(is_admin(uid)))
-            else:
-                log.warning("Unknown admin callback: %s", data)
             return
 
         touch_user(update)
@@ -1787,11 +1780,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await cmd_credits(update, context)
         elif data == "u:help":
             await cmd_help(update, context)
-        else:
-            log.warning("Unknown user callback: %s", data)
 
     except Exception as e:
-        log.exception("on_callback FATAL data=%s: %s", data, e)
+        log.exception("on_callback error data=%s: %s", data, e)
         try:
             if q.message:
                 await q.message.reply_text(f"⚠️ Error: {str(e)[:200]}")
@@ -1807,22 +1798,35 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ===========================================================================
+# STARTUP CHECK
+# ===========================================================================
+def print_startup_banner() -> None:
+    tok_preview = BOT_TOKEN[:15] + "..." + BOT_TOKEN[-5:] if BOT_TOKEN else "EMPTY"
+    print("=" * 65)
+    print("  INDIAN CYBER HUB - OSINT BOT")
+    print("=" * 65)
+    print(f"  BOT_TOKEN       : {tok_preview}")
+    print(f"  DB_PATH         : {DB_PATH}")
+    print(f"  OWNER_ID        : {OWNER_ID}")
+    print(f"  ADMIN_IDS       : {sorted(ADMIN_IDS)}")
+    print(f"  PYTHON          : {os.sys.version.split()[0]}")
+    print(f"  ENV BOT_TOKEN   : {os.getenv('BOT_TOKEN', '<NOT SET>')[:20]}")
+    print("=" * 65)
+
+
+# ===========================================================================
 # MAIN
 # ===========================================================================
 async def run() -> None:
+    print_startup_banner()
+
     init_db()
     load_channels()
 
-    # ⭐ Show which token is loaded (partial)
-    tok_preview = BOT_TOKEN[:15] + "..." + BOT_TOKEN[-5:] if BOT_TOKEN else "EMPTY"
-    log.info("=" * 60)
-    log.info("Bot Token: %s", tok_preview)
-    log.info("Owner: %s | Admins: %s", OWNER_ID, ADMIN_IDS)
-    log.info("DB Path: %s", DB_PATH)
-    log.info("Channels (%d): %s", len(_REQUIRED_CHANNELS),
+    log.info("Loaded %d required channel(s): %s",
+             len(_REQUIRED_CHANNELS),
              [c["username"] for c in _REQUIRED_CHANNELS])
     log.info("Blocked channels: %s", sorted(BLOCKED_CHANNELS))
-    log.info("=" * 60)
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -1868,7 +1872,8 @@ async def run() -> None:
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    log.info("✅ Bot started!")
+
+    log.info("✅ Bot started successfully!")
 
     try:
         await asyncio.Event().wait()
@@ -1883,6 +1888,10 @@ def main() -> None:
         asyncio.run(run())
     except (KeyboardInterrupt, SystemExit):
         log.info("Shutting down…")
+    except Exception as e:
+        log.exception("FATAL: %s", e)
+        print("\n❌ Bot crash ho gaya. Error dekho upar.\n")
+        input("Press Enter to exit...")
 
 
 if __name__ == "__main__":
